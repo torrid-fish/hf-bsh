@@ -6,7 +6,7 @@ Distributed as an extension for the [`hf` CLI](https://huggingface.co/docs/huggi
 — install once, then launch with `hf bsh`. Also works as a standalone binary.
 
 ```
-$ hf bsh buckets/alice/models
+$ hf bsh alice/models
 hf:alice/models> ls
                   checkpoints/
   2025-01-15 18:02     42 MB  config.json
@@ -42,13 +42,13 @@ it's well-optimised for that and we don't try to compete.
 
 ```
 hf extensions install torrid-fish/hf-bsh
-hf bsh buckets/<ns>/<name>
+hf bsh <ns>/<name>
 ```
 
 Or for official-org installs once adopted:
 
 ```
-hf bsh buckets/<ns>/<name>     # auto-installs if missing
+hf bsh <ns>/<name>             # auto-installs if missing
 ```
 
 ### Standalone
@@ -82,8 +82,8 @@ Buckets always require a token; public dataset/model files pulled via
 ## Usage
 
 ```
-hf-bsh [options] [buckets/<ns>/<name>]
-hf bsh [options] [buckets/<ns>/<name>]
+hf-bsh [options] [<ns>/<name>]
+hf bsh [options] [<ns>/<name>]
 ```
 
 Passing a target on entry is equivalent to running `open <target>`
@@ -101,7 +101,7 @@ available as a `cp` source, not as an open target.
 
 | Command | Description |
 |---|---|
-| `open buckets/<ns>/<name>` | open a bucket |
+| `open <ns>/<name>` | open a bucket (also accepts the legacy `buckets/<ns>/<name>` form) |
 | `cd <path>` \| `cd ..` \| `cd /` | change directory (handles `.` / `..` / absolute paths) |
 | `ls [path]` | list entries (mtime, size, name) |
 | `pwd` | print `hf://` URL of cwd |
