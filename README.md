@@ -1,15 +1,16 @@
 # hf-bsh
 
 An interactive **bucket shell** for the Hugging Face Hub, written in Rust.
+
 Distributed as an extension for the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli)
 — install once, then launch with `hf bsh`. Also works as a standalone binary.
 
 ```
 $ hf bsh buckets/alice/models
 hf:alice/models> ls
-            checkpoints/
-   42 MB  2025-01-15 18:02  config.json
-  4.9 GB  2025-01-15 18:02  weights.safetensors
+                  checkpoints/
+  2025-01-15 18:02     42 MB  config.json
+  2025-01-15 18:02    4.9 GB  weights.safetensors
 hf:alice/models> cp hf://datasets/HuggingFaceH4/ultrachat_200k/data/train-00000-of-00003.parquet  raw/
 copied hf://datasets/HuggingFaceH4/ultrachat_200k/data/train-00000-of-00003.parquet -> raw/train-00000-of-00003.parquet
 hf:alice/models> put ./new-weights.safetensors .
@@ -102,7 +103,7 @@ available as a `cp` source, not as an open target.
 |---|---|
 | `open buckets/<ns>/<name>` | open a bucket |
 | `cd <path>` \| `cd ..` \| `cd /` | change directory (handles `.` / `..` / absolute paths) |
-| `ls [path]` | list entries (size, mtime, name) |
+| `ls [path]` | list entries (mtime, size, name) |
 | `pwd` | print `hf://` URL of cwd |
 | `cat <path>` | dump a text file (≤1 MiB, binaries refused) |
 | `du [-h] [path]` | total bytes; `-h` → KB/MB/GB/TB |

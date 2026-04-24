@@ -1401,8 +1401,8 @@ fn walk_tree(node: &TreeNode, prefix_str: &str) {
         let time_s = crate::fmt::fmt_mtime(child.mtime);
         let suffix = if child.is_dir { "/" } else { "" };
         println!(
-            "{:>10}  {:>12}  {}{}{}{}",
-            size_s, time_s, prefix_str, branch, name, suffix
+            "{:>12}  {:>10}  {}{}{}{}",
+            time_s, size_s, prefix_str, branch, name, suffix
         );
         if !child.children.is_empty() {
             let next_prefix = format!("{}{}", prefix_str, if last { "    " } else { "│   " });

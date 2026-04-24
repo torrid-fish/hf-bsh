@@ -33,7 +33,7 @@ pub fn fmt_entry(is_dir: bool, size: Option<u64>, mtime: Option<DateTime<Utc>>, 
     let size_s = if is_dir { String::new() } else { fmt_size(size) };
     let time_s = fmt_mtime(mtime);
     let suffix = if is_dir { "/" } else { "" };
-    format!("{:>10}  {:>12}  {}{}", size_s, time_s, name, suffix)
+    format!("{:>12}  {:>10}  {}{}", time_s, size_s, name, suffix)
 }
 
 /// Parse an ISO 8601 / RFC 3339 timestamp into a `DateTime<Utc>`.
