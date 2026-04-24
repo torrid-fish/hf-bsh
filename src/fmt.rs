@@ -29,8 +29,17 @@ pub fn fmt_mtime(dt: Option<DateTime<Utc>>) -> String {
     }
 }
 
-pub fn fmt_entry(is_dir: bool, size: Option<u64>, mtime: Option<DateTime<Utc>>, name: &str) -> String {
-    let size_s = if is_dir { String::new() } else { fmt_size(size) };
+pub fn fmt_entry(
+    is_dir: bool,
+    size: Option<u64>,
+    mtime: Option<DateTime<Utc>>,
+    name: &str,
+) -> String {
+    let size_s = if is_dir {
+        String::new()
+    } else {
+        fmt_size(size)
+    };
     let time_s = fmt_mtime(mtime);
     let suffix = if is_dir { "/" } else { "" };
     format!("{:>12}  {:>10}  {}{}", time_s, size_s, name, suffix)

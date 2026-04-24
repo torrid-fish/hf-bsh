@@ -49,7 +49,11 @@ struct CliArgs {
 
 fn parse_args() -> Result<CliArgs, String> {
     let mut it = std::env::args().skip(1);
-    let mut out = CliArgs { target: None, endpoint: None, token: None };
+    let mut out = CliArgs {
+        target: None,
+        endpoint: None,
+        token: None,
+    };
     while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" => {
@@ -61,12 +65,16 @@ fn parse_args() -> Result<CliArgs, String> {
                 std::process::exit(0);
             }
             "--endpoint" => {
-                out.endpoint =
-                    Some(it.next().ok_or_else(|| "--endpoint requires a value".to_string())?);
+                out.endpoint = Some(
+                    it.next()
+                        .ok_or_else(|| "--endpoint requires a value".to_string())?,
+                );
             }
             "--token" => {
-                out.token =
-                    Some(it.next().ok_or_else(|| "--token requires a value".to_string())?);
+                out.token = Some(
+                    it.next()
+                        .ok_or_else(|| "--token requires a value".to_string())?,
+                );
             }
             s if s.starts_with("--endpoint=") => {
                 out.endpoint = Some(s["--endpoint=".len()..].to_string());
@@ -130,7 +138,9 @@ fn main() -> ExitCode {
         env!("CARGO_PKG_VERSION")
     );
 
-    let helper = ShellHelper { state: Rc::clone(&shell.state) };
+    let helper = ShellHelper {
+        state: Rc::clone(&shell.state),
+    };
     let mut rl: Editor<ShellHelper, rustyline::history::FileHistory> = match Editor::new() {
         Ok(r) => r,
         Err(e) => {

@@ -32,7 +32,7 @@ pub struct ProgressHandle {
 struct Inner {
     prefix: String,
     start: Instant,
-    total: AtomicU64,      // 0 = unknown (server didn't send Content-Length)
+    total: AtomicU64, // 0 = unknown (server didn't send Content-Length)
     completed: AtomicU64,
     stop: AtomicBool,
     tty: bool,
@@ -62,7 +62,9 @@ impl ProgressBar {
     }
 
     pub fn handle(&self) -> ProgressHandle {
-        ProgressHandle { inner: Arc::clone(&self.inner) }
+        ProgressHandle {
+            inner: Arc::clone(&self.inner),
+        }
     }
 
     /// Stop the render thread and emit a final summary line.

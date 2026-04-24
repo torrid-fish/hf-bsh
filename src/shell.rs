@@ -61,7 +61,11 @@ impl State {
         if !self.is_opened() {
             return "hf> ".to_string();
         }
-        let shown = if self.cwd.is_empty() { String::new() } else { format!("/{}", self.cwd) };
+        let shown = if self.cwd.is_empty() {
+            String::new()
+        } else {
+            format!("/{}", self.cwd)
+        };
         format!("hf:{}{}> ", self.bucket_id, shown)
     }
 
@@ -87,7 +91,11 @@ impl State {
         if !self.is_opened() {
             bail!("nothing opened");
         }
-        let prefix = if rel_dir.is_empty() { None } else { Some(rel_dir) };
+        let prefix = if rel_dir.is_empty() {
+            None
+        } else {
+            Some(rel_dir)
+        };
         let prefix_owned = prefix.map(|p| format!("{}/", p.trim_end_matches('/')));
         self.client
             .list_bucket_tree(&self.bucket_id, prefix_owned.as_deref(), recursive)
@@ -119,7 +127,11 @@ impl State {
                     if tail.is_empty() {
                         continue;
                     }
-                    names.push(if e.is_dir { format!("{}/", tail) } else { tail.to_string() });
+                    names.push(if e.is_dir {
+                        format!("{}/", tail)
+                    } else {
+                        tail.to_string()
+                    });
                 }
             }
             Err(_) => return Vec::new(),
@@ -134,7 +146,11 @@ impl State {
         if rel.is_empty() {
             return Ok(Some((true, None)));
         }
-        let parent = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("").to_string();
+        let parent = rel
+            .rsplit_once('/')
+            .map(|(p, _)| p)
+            .unwrap_or("")
+            .to_string();
         let entries = self.iter_tree(&parent, false)?;
         for e in entries {
             if e.path == rel {
@@ -218,10 +234,20 @@ pub(crate) fn resolve_entries(st: &State, arg: &str) -> Result<Vec<TreeEntry>> {
     }
     let rel = st.remote_prefix(arg);
     if rel.is_empty() {
-        return Ok(vec![TreeEntry { path: String::new(), is_dir: true, size: None, mtime: None }]);
+        return Ok(vec![TreeEntry {
+            path: String::new(),
+            is_dir: true,
+            size: None,
+            mtime: None,
+        }]);
     }
     match st.stat(&rel)? {
-        Some((is_dir, size)) => Ok(vec![TreeEntry { path: rel, is_dir, size, mtime: None }]),
+        Some((is_dir, size)) => Ok(vec![TreeEntry {
+            path: rel,
+            is_dir,
+            size,
+            mtime: None,
+        }]),
         None => bail!("not found: {}", rel),
     }
 }
@@ -260,10 +286,7 @@ pub(crate) fn basename(p: &str) -> &str {
 #[derive(Debug, Clone)]
 enum SourceOrigin {
     OpenedBucket,
-    External {
-        kind: RepoKind,
-        repo_id: String,
-    },
+    External { kind: RepoKind, repo_id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -298,7 +321,10 @@ pub(crate) fn parse_hf_url(s: &str) -> Result<Option<HfUrl>> {
     } else if let Some(r) = rest.strip_prefix("models/") {
         (RepoKind::Model, r)
     } else {
-        bail!("hf url: must start with hf://{{buckets,datasets,models}}/ (got {:?})", s);
+        bail!(
+            "hf url: must start with hf://{{buckets,datasets,models}}/ (got {:?})",
+            s
+        );
     };
     // Buckets need `<ns>/<name>/<path>` — two slash-separated id components
     // before the path. Datasets/models may be single-segment ids.
@@ -345,7 +371,11 @@ pub(crate) fn parse_hf_url(s: &str) -> Result<Option<HfUrl>> {
             }
         }
     };
-    Ok(Some(HfUrl { kind, repo_id, path }))
+    Ok(Some(HfUrl {
+        kind,
+        repo_id,
+        path,
+    }))
 }
 
 // ----------------------------------------------------------------------
@@ -492,7 +522,12 @@ impl Shell {
         } else {
             format!("{}/", rel.trim_end_matches('/'))
         };
-        let mut items: Vec<(String, bool, Option<u64>, Option<chrono::DateTime<chrono::Utc>>)> = Vec::new();
+        let mut items: Vec<(
+            String,
+            bool,
+            Option<u64>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        )> = Vec::new();
         for e in st.iter_tree(&rel, false)? {
             let tail = if !base.is_empty() && e.path.starts_with(&base) {
                 &e.path[base.len()..]
@@ -570,7 +605,11 @@ impl Shell {
             .client
             .download_bucket_file(&st.bucket_id, &info, CAT_MAX_SIZE)?;
         if data.len() as u64 > CAT_MAX_SIZE {
-            bail!("cat: {}: exceeds {} limit", rel, fmt_size(Some(CAT_MAX_SIZE)));
+            bail!(
+                "cat: {}: exceeds {} limit",
+                rel,
+                fmt_size(Some(CAT_MAX_SIZE))
+            );
         }
         let head_len = data.len().min(8192);
         if data[..head_len].contains(&0u8) {
@@ -594,7 +633,11 @@ impl Shell {
         }
         let tokens = shell_words::split(arg).map_err(|e| anyhow!("parse error: {}", e))?;
         let human = tokens.iter().any(|t| t == "-h");
-        let rest: Vec<&str> = tokens.iter().filter(|t| *t != "-h").map(String::as_str).collect();
+        let rest: Vec<&str> = tokens
+            .iter()
+            .filter(|t| *t != "-h")
+            .map(String::as_str)
+            .collect();
         if rest.len() > 1 {
             bail!("du: too many arguments (usage: du [-h] [path])");
         }
@@ -718,7 +761,10 @@ impl Shell {
                         }
                         let entry = node.children.entry(p.to_string()).or_insert_with(|| {
                             n_dirs += 1;
-                            TreeNode { is_dir: true, ..Default::default() }
+                            TreeNode {
+                                is_dir: true,
+                                ..Default::default()
+                            }
                         });
                         node = entry;
                     }
@@ -729,7 +775,10 @@ impl Shell {
             for p in &parts[..parts.len() - 1] {
                 let entry = node.children.entry(p.to_string()).or_insert_with(|| {
                     n_dirs += 1;
-                    TreeNode { is_dir: true, ..Default::default() }
+                    TreeNode {
+                        is_dir: true,
+                        ..Default::default()
+                    }
                 });
                 node = entry;
             }
@@ -767,7 +816,11 @@ impl Shell {
         }
         let tokens = shell_words::split(arg).map_err(|e| anyhow!("parse error: {}", e))?;
         let recursive = tokens.iter().any(|t| t == "-r");
-        let args: Vec<&str> = tokens.iter().filter(|t| *t != "-r").map(|s| s.as_str()).collect();
+        let args: Vec<&str> = tokens
+            .iter()
+            .filter(|t| *t != "-r")
+            .map(|s| s.as_str())
+            .collect();
         if args.is_empty() {
             bail!("rm: missing path (usage: rm [-r] <path>...)");
         }
@@ -852,10 +905,16 @@ impl Shell {
                 // External source. `mv` isn't allowed here — we don't own the
                 // source-side delete permission for foreign repos.
                 if delete_sources {
-                    bail!("{}: external sources (hf://...) can only be copied, not moved", op);
+                    bail!(
+                        "{}: external sources (hf://...) can only be copied, not moved",
+                        op
+                    );
                 }
                 if has_glob_chars(&url.path) {
-                    bail!("{}: globs in hf:// sources aren't supported yet (use concrete paths)", op);
+                    bail!(
+                        "{}: globs in hf:// sources aren't supported yet (use concrete paths)",
+                        op
+                    );
                 }
                 if url.path.is_empty() {
                     bail!("{}: missing path in {:?}", op, s);
@@ -911,7 +970,8 @@ impl Shell {
         if src_entries.len() > 1 && !dst_is_dir {
             bail!(
                 "{}: target {:?} is not a directory (add trailing / or use an existing directory)",
-                op, dst_arg
+                op,
+                dst_arg
             );
         }
         let dst_base = self
@@ -967,17 +1027,18 @@ impl Shell {
             .filter(|(o, _, _)| matches!(o, SourceOrigin::OpenedBucket))
             .map(|(_, s, _)| s.clone())
             .collect();
-        let mut own_hashes: std::collections::HashMap<String, String> = if !own_bucket_paths.is_empty() {
-            self.state
-                .borrow()
-                .client
-                .bucket_paths_info(&bucket, &own_bucket_paths)?
-                .into_iter()
-                .map(|i| (i.path, i.xet_hash))
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        };
+        let mut own_hashes: std::collections::HashMap<String, String> =
+            if !own_bucket_paths.is_empty() {
+                self.state
+                    .borrow()
+                    .client
+                    .bucket_paths_info(&bucket, &own_bucket_paths)?
+                    .into_iter()
+                    .map(|i| (i.path, i.xet_hash))
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
 
         let mut copies: Vec<BucketCopyOp> = Vec::with_capacity(pairs.len());
         for (origin, src, dst) in &pairs {
@@ -1156,14 +1217,18 @@ impl Shell {
             .filter_map(|(p, _)| std::fs::metadata(p).ok().map(|m| m.len()))
             .sum();
         let bar = ProgressBar::new(
-            format!("uploading {} file{}", pairs.len(), if pairs.len() == 1 { "" } else { "s" }),
+            format!(
+                "uploading {} file{}",
+                pairs.len(),
+                if pairs.len() == 1 { "" } else { "s" }
+            ),
             total_bytes,
         );
-        let upload_result = self
-            .state
-            .borrow()
-            .client
-            .xet_upload_files(&bucket, &pairs, Some(bar.handle()));
+        let upload_result =
+            self.state
+                .borrow()
+                .client
+                .xet_upload_files(&bucket, &pairs, Some(bar.handle()));
         bar.finish();
         let uploaded = upload_result?;
         let mut adds: Vec<BucketAddOp> = Vec::with_capacity(uploaded.len());
@@ -1173,9 +1238,7 @@ impl Shell {
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as i64)
-                .unwrap_or_else(|| {
-                    (chrono::Utc::now().timestamp_millis()).max(0)
-                });
+                .unwrap_or_else(|| (chrono::Utc::now().timestamp_millis()).max(0));
             adds.push(BucketAddOp {
                 destination: info.remote_path.clone(),
                 xet_hash: info.xet_hash.clone(),
@@ -1276,7 +1339,10 @@ impl Shell {
                     }
                     saw_file = true;
                     let sub = e.path.strip_prefix(&prefix).unwrap_or(&e.path);
-                    pairs.push((e.path.clone(), landing.join(sub.replace('/', std::path::MAIN_SEPARATOR_STR))));
+                    pairs.push((
+                        e.path.clone(),
+                        landing.join(sub.replace('/', std::path::MAIN_SEPARATOR_STR)),
+                    ));
                 }
                 if !saw_file {
                     bail!("get: directory {:?} is empty", src_path);
@@ -1343,8 +1409,8 @@ fn walk_local_dir(
         dir: &std::path::Path,
         cb: &mut dyn FnMut(&std::path::Path, &str),
     ) -> Result<()> {
-        for entry in std::fs::read_dir(dir)
-            .with_context(|| format!("read_dir {}", dir.display()))?
+        for entry in
+            std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?
         {
             let entry = entry.with_context(|| format!("read_dir entry in {}", dir.display()))?;
             let path = entry.path();
@@ -1370,7 +1436,9 @@ fn walk_local_dir(
 /// a user actually uploads from the REPL. Returns `None` for unknowns; the
 /// server fills in `application/octet-stream` by default.
 fn guess_content_type(remote_path: &str) -> Option<String> {
-    let ext = remote_path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase())?;
+    let ext = remote_path
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())?;
     let ct = match ext.as_str() {
         "json" => "application/json",
         "txt" | "log" | "md" | "csv" | "tsv" => "text/plain",
@@ -1414,7 +1482,11 @@ fn walk_tree(node: &TreeNode, prefix_str: &str) {
     for (i, (name, child)) in entries.into_iter().enumerate() {
         let last = i == n - 1;
         let branch = if last { "└── " } else { "├── " };
-        let size_s = if child.is_dir { String::new() } else { fmt_size(child.size) };
+        let size_s = if child.is_dir {
+            String::new()
+        } else {
+            fmt_size(child.size)
+        };
         let time_s = crate::fmt::fmt_mtime(child.mtime);
         let suffix = if child.is_dir { "/" } else { "" };
         println!(
@@ -1505,7 +1577,10 @@ impl Completer for ShellHelper {
             let candidates: Vec<Pair> = COMMANDS
                 .iter()
                 .filter(|c| c.starts_with(token))
-                .map(|c| Pair { display: (*c).to_string(), replacement: format!("{} ", c) })
+                .map(|c| Pair {
+                    display: (*c).to_string(),
+                    replacement: format!("{} ", c),
+                })
                 .collect();
             return Ok((start, candidates));
         }
@@ -1558,7 +1633,10 @@ fn complete_local_path(text: &str) -> Vec<Pair> {
     // Bare "~" is rare but convenient — offer "~/" as the single candidate so
     // the next keystroke starts listing $HOME.
     if text == "~" {
-        return vec![Pair { display: "~/".into(), replacement: "~/".into() }];
+        return vec![Pair {
+            display: "~/".into(),
+            replacement: "~/".into(),
+        }];
     }
     let (dir_part, prefix) = match text.rsplit_once('/') {
         Some((d, p)) => (if d.is_empty() { "/" } else { d }, p),
@@ -1587,7 +1665,10 @@ fn complete_local_path(text: &str) -> Vec<Pair> {
         let suffix = if is_dir { "/" } else { "" };
         let replacement = format!("{}{}{}", head, name, suffix);
         let display = format!("{}{}", name, suffix);
-        out.push(Pair { display, replacement });
+        out.push(Pair {
+            display,
+            replacement,
+        });
     }
     out
 }
@@ -1619,13 +1700,20 @@ fn complete_remote_path(state: &Rc<RefCell<State>>, text: &str) -> Vec<Pair> {
         st.remote_prefix(dir_part)
     };
     let names = state.borrow_mut().listdir(&rel);
-    let head = if dir_part.is_empty() { String::new() } else { format!("{}/", dir_part) };
+    let head = if dir_part.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", dir_part)
+    };
     names
         .into_iter()
         .filter(|n| n.starts_with(prefix))
         .map(|n| {
             let replacement = format!("{}{}", head, n);
-            Pair { display: n, replacement }
+            Pair {
+                display: n,
+                replacement,
+            }
         })
         .collect()
 }
@@ -1651,7 +1739,10 @@ fn complete_hf_url(state: &Rc<RefCell<State>>, text: &str) -> Vec<Pair> {
             return results;
         }
         for p in prefixes {
-            results.push(Pair { display: p.into(), replacement: p.into() });
+            results.push(Pair {
+                display: p.into(),
+                replacement: p.into(),
+            });
         }
         return results;
     }
@@ -1662,7 +1753,10 @@ fn complete_hf_url(state: &Rc<RefCell<State>>, text: &str) -> Vec<Pair> {
             for id in ids {
                 if id.starts_with(q) {
                     let s = format!("hf://datasets/{}/", id);
-                    results.push(Pair { display: s.clone(), replacement: s });
+                    results.push(Pair {
+                        display: s.clone(),
+                        replacement: s,
+                    });
                 }
             }
         }
@@ -1673,7 +1767,10 @@ fn complete_hf_url(state: &Rc<RefCell<State>>, text: &str) -> Vec<Pair> {
             for id in ids {
                 if id.starts_with(q) {
                     let s = format!("hf://models/{}/", id);
-                    results.push(Pair { display: s.clone(), replacement: s });
+                    results.push(Pair {
+                        display: s.clone(),
+                        replacement: s,
+                    });
                 }
             }
         }
@@ -1684,7 +1781,10 @@ fn complete_hf_url(state: &Rc<RefCell<State>>, text: &str) -> Vec<Pair> {
             for b in buckets {
                 if b.starts_with(q) {
                     let s = format!("hf://buckets/{}/", b);
-                    results.push(Pair { display: s.clone(), replacement: s });
+                    results.push(Pair {
+                        display: s.clone(),
+                        replacement: s,
+                    });
                 }
             }
         }
@@ -1707,7 +1807,10 @@ fn complete_open(state: &Rc<RefCell<State>>, text: &str) -> Vec<Pair> {
         for b in buckets {
             if b.starts_with(q) {
                 let s = format!("{}{}", prefix, b);
-                results.push(Pair { display: s.clone(), replacement: s });
+                results.push(Pair {
+                    display: s.clone(),
+                    replacement: s,
+                });
             }
         }
     }
@@ -1723,7 +1826,10 @@ mod tests {
         assert_eq!(split_cmd("ls"), ("ls", ""));
         assert_eq!(split_cmd("ls foo"), ("ls", "foo"));
         assert_eq!(split_cmd("  ls   foo bar"), ("", "ls   foo bar"));
-        assert_eq!(split_cmd("cat path/with/spaces in it"), ("cat", "path/with/spaces in it"));
+        assert_eq!(
+            split_cmd("cat path/with/spaces in it"),
+            ("cat", "path/with/spaces in it")
+        );
     }
 
     #[test]
@@ -1778,8 +1884,14 @@ mod tests {
 
     #[test]
     fn guess_content_type_known_extensions() {
-        assert_eq!(guess_content_type("a/b/x.json").as_deref(), Some("application/json"));
-        assert_eq!(guess_content_type("README.md").as_deref(), Some("text/plain"));
+        assert_eq!(
+            guess_content_type("a/b/x.json").as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(
+            guess_content_type("README.md").as_deref(),
+            Some("text/plain")
+        );
         assert_eq!(guess_content_type("pic.JPG").as_deref(), Some("image/jpeg"));
         assert_eq!(
             guess_content_type("weights.safetensors").as_deref(),
@@ -1849,7 +1961,9 @@ mod tests {
 
     #[test]
     fn parse_hf_url_bucket_needs_ns_and_name() {
-        let u = parse_hf_url("hf://buckets/alice/my-bucket/path/to/file").unwrap().unwrap();
+        let u = parse_hf_url("hf://buckets/alice/my-bucket/path/to/file")
+            .unwrap()
+            .unwrap();
         assert_eq!(u.kind, RepoKind::Bucket);
         assert_eq!(u.repo_id, "alice/my-bucket");
         assert_eq!(u.path, "path/to/file");
@@ -1866,7 +1980,9 @@ mod tests {
 
     #[test]
     fn parse_hf_url_dataset_legacy_single_segment_id() {
-        let u = parse_hf_url("hf://datasets/squad/train.parquet").unwrap().unwrap();
+        let u = parse_hf_url("hf://datasets/squad/train.parquet")
+            .unwrap()
+            .unwrap();
         assert_eq!(u.kind, RepoKind::Dataset);
         assert_eq!(u.repo_id, "squad");
         assert_eq!(u.path, "train.parquet");

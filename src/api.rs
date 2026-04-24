@@ -109,10 +109,7 @@ impl Client {
             .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
         let token = token.or_else(load_token);
         let mut default_headers = HeaderMap::new();
-        default_headers.insert(
-            HDR_UA,
-            HeaderValue::from_static(USER_AGENT),
-        );
+        default_headers.insert(HDR_UA, HeaderValue::from_static(USER_AGENT));
         if let Some(tok) = &token {
             if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", tok)) {
                 default_headers.insert(AUTHORIZATION, v);
@@ -124,7 +121,11 @@ impl Client {
             .default_headers(default_headers)
             .build()
             .expect("reqwest client build");
-        Self { http, endpoint, token }
+        Self {
+            http,
+            endpoint,
+            token,
+        }
     }
 
     // ------------------------------------------------------------------
@@ -233,7 +234,11 @@ impl Client {
                 .ok_or_else(|| anyhow!("paths-info: entry missing 'xetHash'"))?
                 .to_string();
             let size = v.get("size").and_then(|x| x.as_u64());
-            out.push(BucketPathInfo { path, xet_hash, size });
+            out.push(BucketPathInfo {
+                path,
+                xet_hash,
+                size,
+            });
         }
         Ok(out)
     }
@@ -299,10 +304,7 @@ impl Client {
         if self.token.is_none() {
             bail!("bucket access requires an HF token (set HF_TOKEN or --token)");
         }
-        let url = format!(
-            "{}/api/buckets/{}/xet-read-token",
-            self.endpoint, bucket_id
-        );
+        let url = format!("{}/api/buckets/{}/xet-read-token", self.endpoint, bucket_id);
         let resp = send_checked(self.http.get(&url))?;
         resp.json::<CasJwt>().context("parse xet-read-token json")
     }
@@ -501,13 +503,16 @@ impl Client {
 
         let mut out = Vec::with_capacity(files.len());
         for (handle, (local, remote)) in handles.into_iter().zip(files.iter()) {
-            let meta = report
-                .uploads
-                .get(&handle.task_id())
-                .ok_or_else(|| anyhow!("xet commit: missing upload metadata for {}", local.display()))?;
-            let size = meta.xet_info.file_size.unwrap_or_else(|| {
-                std::fs::metadata(local).map(|m| m.len()).unwrap_or(0)
-            });
+            let meta = report.uploads.get(&handle.task_id()).ok_or_else(|| {
+                anyhow!(
+                    "xet commit: missing upload metadata for {}",
+                    local.display()
+                )
+            })?;
+            let size = meta
+                .xet_info
+                .file_size
+                .unwrap_or_else(|| std::fs::metadata(local).map(|m| m.len()).unwrap_or(0));
             out.push(UploadedFile {
                 remote_path: remote.clone(),
                 xet_hash: meta.xet_info.hash.clone(),
@@ -544,8 +549,7 @@ impl Client {
                 }
             }
             if info.size == Some(0) {
-                std::fs::File::create(dst)
-                    .with_context(|| format!("touch {}", dst.display()))?;
+                std::fs::File::create(dst).with_context(|| format!("touch {}", dst.display()))?;
                 continue;
             }
             to_download.push((
@@ -616,11 +620,7 @@ impl Client {
     // Internals: pagination + request helpers
     // ------------------------------------------------------------------
 
-    fn paginate_json(
-        &self,
-        url: &str,
-        params: &[(&str, &str)],
-    ) -> Result<Vec<serde_json::Value>> {
+    fn paginate_json(&self, url: &str, params: &[(&str, &str)]) -> Result<Vec<serde_json::Value>> {
         let mut out = Vec::new();
         let mut resp = send_checked(self.http.get(url).query(params))?;
         loop {
@@ -633,11 +633,7 @@ impl Client {
         Ok(out)
     }
 
-    fn get_json_array(
-        &self,
-        url: &str,
-        params: &[(&str, &str)],
-    ) -> Result<Vec<serde_json::Value>> {
+    fn get_json_array(&self, url: &str, params: &[(&str, &str)]) -> Result<Vec<serde_json::Value>> {
         let resp = send_checked(self.http.get(url).query(params))?;
         let v: serde_json::Value = resp.json().context("parse json")?;
         match v {
@@ -748,7 +744,11 @@ fn load_token() -> Option<String> {
     let token_path = std::env::var("HF_TOKEN_PATH")
         .map(std::path::PathBuf::from)
         .ok()
-        .or_else(|| std::env::var("HF_HOME").ok().map(|h| std::path::PathBuf::from(h).join("token")))
+        .or_else(|| {
+            std::env::var("HF_HOME")
+                .ok()
+                .map(|h| std::path::PathBuf::from(h).join("token"))
+        })
         .unwrap_or_else(|| {
             let base = std::env::var("XDG_CACHE_HOME")
                 .map(std::path::PathBuf::from)
