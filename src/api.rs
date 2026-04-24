@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -7,6 +10,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_
 use serde::Deserialize;
 
 use crate::fmt::parse_datetime;
+use crate::progress::ProgressHandle;
 
 const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
 const DEFAULT_REVISION: &str = "main";
@@ -49,6 +53,26 @@ pub struct BucketCopyOp {
     pub source_repo_id: String,
     pub xet_hash: String,
     pub destination: String,
+}
+
+/// A single `addFile` operation for `bucket_batch`. `xet_hash` must already
+/// reference CAS-ingested data (e.g. from `xet_upload_files`). `mtime_ms` is
+/// the file modification time in milliseconds since the Unix epoch.
+#[derive(Debug, Clone)]
+pub struct BucketAddOp {
+    pub destination: String,
+    pub xet_hash: String,
+    pub mtime_ms: i64,
+    pub content_type: Option<String>,
+}
+
+/// Result of a single successful CAS upload performed by `xet_upload_files`.
+/// The caller combines these with mtime / content-type to build `BucketAddOp`s.
+#[derive(Debug, Clone)]
+pub struct UploadedFile {
+    pub remote_path: String,
+    pub xet_hash: String,
+    pub size: u64,
 }
 
 /// CAS JWT handshake response, as returned by `GET /api/buckets/{id}/xet-{op}-token`.
@@ -106,38 +130,6 @@ impl Client {
     // ------------------------------------------------------------------
     // Listings
     // ------------------------------------------------------------------
-
-    pub fn list_repo_tree(
-        &self,
-        kind: RepoKind,
-        repo_id: &str,
-        path_in_repo: Option<&str>,
-        recursive: bool,
-    ) -> Result<Vec<TreeEntry>> {
-        assert!(!matches!(kind, RepoKind::Bucket));
-        let encoded = path_in_repo
-            .filter(|p| !p.is_empty())
-            .map(|p| format!("/{}", urlencoding::encode(p)))
-            .unwrap_or_default();
-        let url = format!(
-            "{}/api/{}/{}/tree/{}{}",
-            self.endpoint,
-            kind.repo_type_path(),
-            repo_id,
-            DEFAULT_REVISION,
-            encoded,
-        );
-        let params = &[
-            ("recursive", if recursive { "true" } else { "false" }),
-            ("expand", "true"),
-        ];
-        let raw = self.paginate_json(&url, params)?;
-        let mut out = Vec::with_capacity(raw.len());
-        for v in raw {
-            out.push(parse_repo_entry(&v)?);
-        }
-        Ok(out)
-    }
 
     pub fn list_bucket_tree(
         &self,
@@ -246,20 +238,35 @@ impl Client {
         Ok(out)
     }
 
-    /// Execute a batch of copy/delete operations on a bucket. Server-side only —
-    /// no xet data-plane traffic. `copies` may reference files in the same bucket
+    /// Execute a batch of add/copy/delete operations on a bucket. Server-side only —
+    /// no xet data-plane traffic (CAS ingestion for `adds` must have happened first,
+    /// e.g. via `xet_upload_files`). `copies` may reference files in the same bucket
     /// (`source_repo_type = "bucket"`, `source_repo_id = bucket_id`) or any other repo.
     pub fn bucket_batch(
         &self,
         bucket_id: &str,
+        adds: &[BucketAddOp],
         copies: &[BucketCopyOp],
         deletes: &[String],
     ) -> Result<()> {
-        if copies.is_empty() && deletes.is_empty() {
+        if adds.is_empty() && copies.is_empty() && deletes.is_empty() {
             return Ok(());
         }
         let url = format!("{}/api/buckets/{}/batch", self.endpoint, bucket_id);
         let mut body = Vec::<u8>::new();
+        for op in adds {
+            let mut payload = serde_json::json!({
+                "type": "addFile",
+                "path": op.destination,
+                "xetHash": op.xet_hash,
+                "mtime": op.mtime_ms,
+            });
+            if let Some(ct) = &op.content_type {
+                payload["contentType"] = serde_json::Value::String(ct.clone());
+            }
+            serde_json::to_writer(&mut body, &payload).context("ndjson add")?;
+            body.push(b'\n');
+        }
         for op in copies {
             let payload = serde_json::json!({
                 "type": "copyFile",
@@ -298,6 +305,20 @@ impl Client {
         );
         let resp = send_checked(self.http.get(&url))?;
         resp.json::<CasJwt>().context("parse xet-read-token json")
+    }
+
+    /// Exchange the HF bearer token for a CAS JWT used by the xet data plane
+    /// with write scope — needed to upload new files into the bucket.
+    pub fn cas_write_token(&self, bucket_id: &str) -> Result<CasJwt> {
+        if self.token.is_none() {
+            bail!("bucket upload requires an HF token (set HF_TOKEN or --token)");
+        }
+        let url = format!(
+            "{}/api/buckets/{}/xet-write-token",
+            self.endpoint, bucket_id
+        );
+        let resp = send_checked(self.http.get(&url))?;
+        resp.json::<CasJwt>().context("parse xet-write-token json")
     }
 
     /// Download a bucket file into memory via the xet data plane. Caps at
@@ -349,41 +370,246 @@ impl Client {
     }
 
     // ------------------------------------------------------------------
-    // Downloads (repo only — buckets go through xet)
+    // (Dataset / model local downloads were removed — use `hf download`.)
     // ------------------------------------------------------------------
 
-    /// Download a single file as raw bytes. Refuses if the file exceeds `max_bytes`.
-    pub fn download_repo_file(
+    /// Fetch the xet hash + size for a single file in a dataset or model repo.
+    /// Issues `HEAD /{repo_or_datasets/repo}/resolve/main/<path>` and pulls the
+    /// values from `X-Xet-Hash` and `X-Linked-Size`. Fails clearly when the
+    /// file isn't xet-backed (e.g. very old LFS-only repos) — callers can
+    /// surface that to the user so they know to fall back to `hf download`.
+    pub fn repo_xet_info(
         &self,
         kind: RepoKind,
         repo_id: &str,
         path_in_repo: &str,
-        max_bytes: u64,
-    ) -> Result<Vec<u8>> {
-        let url = match kind {
-            RepoKind::Model => format!(
-                "{}/{}/resolve/{}/{}",
-                self.endpoint,
-                repo_id,
-                DEFAULT_REVISION,
-                encode_path_keep_slashes(path_in_repo),
-            ),
-            RepoKind::Dataset => format!(
-                "{}/datasets/{}/resolve/{}/{}",
-                self.endpoint,
-                repo_id,
-                DEFAULT_REVISION,
-                encode_path_keep_slashes(path_in_repo),
-            ),
-            RepoKind::Bucket => {
-                bail!("cat on buckets is not supported in this build (requires xet protocol)")
-            }
+    ) -> Result<BucketPathInfo> {
+        if matches!(kind, RepoKind::Bucket) {
+            bail!("repo_xet_info: use bucket_paths_info for bucket sources");
+        }
+        let prefix = match kind {
+            RepoKind::Dataset => "datasets/",
+            RepoKind::Model => "",
+            RepoKind::Bucket => unreachable!(),
         };
-        let resp = send_checked(self.http.get(&url))?;
-        // Cap at max_bytes + 1 so the caller can detect overflow.
-        let limit = max_bytes.saturating_add(1);
-        let bytes = read_limited(resp, limit)?;
-        Ok(bytes)
+        let url = format!(
+            "{}/{}{}/resolve/{}/{}",
+            self.endpoint,
+            prefix,
+            repo_id,
+            DEFAULT_REVISION,
+            encode_path_keep_slashes(path_in_repo),
+        );
+        let resp = send_checked(self.http.head(&url))?;
+        let headers = resp.headers();
+        let xet_hash = headers
+            .get("x-xet-hash")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}: not xet-backed (no X-Xet-Hash header); use `hf download` + `put` instead",
+                    path_in_repo
+                )
+            })?;
+        let size = headers
+            .get("x-linked-size")
+            .or_else(|| headers.get("content-length"))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        Ok(BucketPathInfo {
+            path: path_in_repo.to_string(),
+            xet_hash,
+            size,
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // Bucket uploads (xet CAS + /batch addFile)
+    // ------------------------------------------------------------------
+
+    /// Upload local files to the bucket's xet CAS and return the resulting
+    /// `(remote_path, xet_hash, size)` triples. Order is preserved — the
+    /// i-th input maps to the i-th output. This step does **not** make the
+    /// files visible in the bucket; call `bucket_batch` with the returned
+    /// data wrapped as `BucketAddOp`s to commit them.
+    ///
+    /// If `progress` is supplied, a background thread polls
+    /// `XetUploadCommit::progress()` every 100 ms and pushes
+    /// `(total_bytes, total_bytes_completed)` into the handle.
+    pub fn xet_upload_files(
+        &self,
+        bucket_id: &str,
+        files: &[(std::path::PathBuf, String)],
+        progress: Option<ProgressHandle>,
+    ) -> Result<Vec<UploadedFile>> {
+        use xet::xet_session::{Sha256Policy, XetSessionBuilder};
+
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let jwt = self.cas_write_token(bucket_id)?;
+        let session = XetSessionBuilder::new()
+            .build()
+            .map_err(|e| anyhow!("xet session build failed: {}", e))?;
+        let commit = session
+            .new_upload_commit()
+            .map_err(|e| anyhow!("xet new_upload_commit: {}", e))?
+            .with_endpoint(jwt.cas_url)
+            .with_token_info(jwt.access_token, jwt.exp)
+            .build_blocking()
+            .map_err(|e| anyhow!("xet upload commit build: {}", e))?;
+
+        let mut handles = Vec::with_capacity(files.len());
+        for (local, _remote) in files {
+            let h = commit
+                .upload_from_path_blocking(local.clone(), Sha256Policy::Compute)
+                .map_err(|e| anyhow!("xet upload_from_path {}: {}", local.display(), e))?;
+            handles.push(h);
+        }
+
+        // Poll the commit's GroupProgressReport on a side thread.
+        let stop = Arc::new(AtomicBool::new(false));
+        let poll = progress.as_ref().map(|p| {
+            let p = p.clone();
+            let commit = commit.clone();
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || loop {
+                let r = commit.progress();
+                p.set_total(r.total_bytes);
+                p.set_completed(r.total_bytes_completed);
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            })
+        });
+
+        let commit_result = commit.commit_blocking();
+        stop.store(true, Ordering::Release);
+        if let Some(j) = poll {
+            let _ = j.join();
+        }
+        // Final catch-up read in case the bar missed the last tick.
+        if let Some(p) = &progress {
+            let r = commit.progress();
+            p.set_total(r.total_bytes);
+            p.set_completed(r.total_bytes_completed);
+        }
+        let report = commit_result.map_err(|e| anyhow!("xet commit: {}", e))?;
+
+        let mut out = Vec::with_capacity(files.len());
+        for (handle, (local, remote)) in handles.into_iter().zip(files.iter()) {
+            let meta = report
+                .uploads
+                .get(&handle.task_id())
+                .ok_or_else(|| anyhow!("xet commit: missing upload metadata for {}", local.display()))?;
+            let size = meta.xet_info.file_size.unwrap_or_else(|| {
+                std::fs::metadata(local).map(|m| m.len()).unwrap_or(0)
+            });
+            out.push(UploadedFile {
+                remote_path: remote.clone(),
+                xet_hash: meta.xet_info.hash.clone(),
+                size,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Download a list of bucket files directly to local paths. Parent
+    /// directories are created as needed. Zero-byte files are touched
+    /// without a CAS round-trip. Optional `progress` is driven from the
+    /// `XetFileDownloadGroup`'s report.
+    pub fn download_bucket_files_to_paths(
+        &self,
+        bucket_id: &str,
+        files: &[(BucketPathInfo, std::path::PathBuf)],
+        progress: Option<ProgressHandle>,
+    ) -> Result<()> {
+        use xet::xet_session::{XetFileInfo, XetSessionBuilder};
+
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        // Create parent dirs up front; also short-circuit zero-size files
+        // so we don't hand empty descriptors to the xet group (it rejects them).
+        let mut to_download: Vec<(XetFileInfo, std::path::PathBuf)> = Vec::new();
+        for (info, dst) in files {
+            if let Some(parent) = dst.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("create dir {}", parent.display()))?;
+                }
+            }
+            if info.size == Some(0) {
+                std::fs::File::create(dst)
+                    .with_context(|| format!("touch {}", dst.display()))?;
+                continue;
+            }
+            to_download.push((
+                XetFileInfo {
+                    hash: info.xet_hash.clone(),
+                    file_size: info.size,
+                    sha256: None,
+                },
+                dst.clone(),
+            ));
+        }
+        if to_download.is_empty() {
+            return Ok(());
+        }
+
+        let jwt = self.cas_read_token(bucket_id)?;
+        let session = XetSessionBuilder::new()
+            .build()
+            .map_err(|e| anyhow!("xet session build failed: {}", e))?;
+        let group = session
+            .new_file_download_group()
+            .map_err(|e| anyhow!("xet new_file_download_group: {}", e))?
+            .with_endpoint(jwt.cas_url)
+            .with_token_info(jwt.access_token, jwt.exp)
+            .build_blocking()
+            .map_err(|e| anyhow!("xet download group build: {}", e))?;
+
+        for (info, dst) in to_download {
+            group
+                .download_file_to_path_blocking(info, dst.clone())
+                .map_err(|e| anyhow!("xet enqueue {}: {}", dst.display(), e))?;
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let poll = progress.as_ref().map(|p| {
+            let p = p.clone();
+            let group = group.clone();
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || loop {
+                let r = group.progress();
+                p.set_total(r.total_bytes);
+                p.set_completed(r.total_bytes_completed);
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            })
+        });
+
+        // finish_blocking consumes the group, so the caller's poll clone is
+        // how we still read progress after the fact.
+        let observer = group.clone();
+        let finish_result = group.finish_blocking();
+        stop.store(true, Ordering::Release);
+        if let Some(j) = poll {
+            let _ = j.join();
+        }
+        if let Some(p) = &progress {
+            let r = observer.progress();
+            p.set_total(r.total_bytes);
+            p.set_completed(r.total_bytes_completed);
+        }
+        finish_result.map_err(|e| anyhow!("xet download finish: {}", e))?;
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -451,16 +677,6 @@ fn send_checked(rb: RequestBuilder) -> Result<Response> {
     Ok(resp)
 }
 
-/// Read at most `limit` bytes from `resp` into a `Vec<u8>`. Stops early if the
-/// server is larger than `limit`.
-fn read_limited(resp: Response, limit: u64) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let mut reader = resp.take(limit);
-    let mut buf = Vec::new();
-    reader.read_to_end(&mut buf).context("read response body")?;
-    Ok(buf)
-}
-
 /// Parse a GitHub-style `Link:` header value and return the URL with `rel="next"`, if any.
 pub(crate) fn parse_next_link(hdr: &str) -> Option<String> {
     for part in hdr.split(',') {
@@ -489,38 +705,6 @@ fn map_reqwest_err(e: reqwest::Error) -> anyhow::Error {
     } else {
         anyhow!("{}", e)
     }
-}
-
-#[derive(Deserialize)]
-struct RepoEntryJson {
-    #[serde(rename = "type")]
-    kind: String,
-    path: String,
-    #[serde(default)]
-    size: Option<u64>,
-    #[serde(default, rename = "last_commit")]
-    last_commit: Option<LastCommit>,
-}
-
-#[derive(Deserialize)]
-struct LastCommit {
-    date: Option<String>,
-}
-
-pub(crate) fn parse_repo_entry(v: &serde_json::Value) -> Result<TreeEntry> {
-    let e: RepoEntryJson = serde_json::from_value(v.clone()).context("parse repo tree entry")?;
-    let is_dir = e.kind == "directory";
-    let mtime = e
-        .last_commit
-        .as_ref()
-        .and_then(|lc| lc.date.as_deref())
-        .and_then(parse_datetime);
-    Ok(TreeEntry {
-        path: e.path,
-        is_dir,
-        size: if is_dir { None } else { e.size },
-        mtime,
-    })
 }
 
 pub(crate) fn parse_bucket_entry(v: &serde_json::Value) -> Result<TreeEntry> {
@@ -613,29 +797,6 @@ mod tests {
             encode_path_keep_slashes("dir with space/file.txt"),
             "dir%20with%20space/file.txt"
         );
-    }
-
-    #[test]
-    fn parse_repo_entry_file_with_commit() {
-        let v = json!({
-            "type": "file",
-            "path": "config.json",
-            "size": 1234,
-            "last_commit": { "date": "2024-06-01T12:34:56.000Z" }
-        });
-        let e = parse_repo_entry(&v).unwrap();
-        assert!(!e.is_dir);
-        assert_eq!(e.path, "config.json");
-        assert_eq!(e.size, Some(1234));
-        assert!(e.mtime.is_some());
-    }
-
-    #[test]
-    fn parse_repo_entry_directory_has_no_size() {
-        let v = json!({ "type": "directory", "path": "subdir" });
-        let e = parse_repo_entry(&v).unwrap();
-        assert!(e.is_dir);
-        assert_eq!(e.size, None);
     }
 
     #[test]

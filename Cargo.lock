@@ -920,6 +920,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hf-bsh"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs 5.0.1",
+ "glob",
+ "hf-xet",
+ "reqwest",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "urlencoding",
+]
+
+[[package]]
 name = "hf-xet"
 version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -939,23 +956,6 @@ dependencies = [
  "xet-core-structures",
  "xet-data",
  "xet-runtime",
-]
-
-[[package]]
-name = "hfsh"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "dirs 5.0.1",
- "glob",
- "hf-xet",
- "reqwest",
- "rustyline",
- "serde",
- "serde_json",
- "shell-words",
- "urlencoding",
 ]
 
 [[package]]

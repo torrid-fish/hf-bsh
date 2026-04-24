@@ -3,24 +3,26 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::rc::Rc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Context, Helper};
 
-use crate::api::{BucketCopyOp, Client, RepoKind, TreeEntry};
+use crate::api::{BucketAddOp, BucketCopyOp, BucketPathInfo, Client, RepoKind, TreeEntry};
 use crate::fmt::{fmt_entry, fmt_size};
+use crate::progress::ProgressBar;
 
 pub const CAT_MAX_SIZE: u64 = 1 << 20; // 1 MiB
 
 /// Mutable shell state. Held inside an `Rc<RefCell<_>>` so the rustyline helper
-/// and the REPL loop can both touch it.
+/// and the REPL loop can both touch it. `bucket_id` being empty means "no
+/// bucket currently opened" — we're bucket-only now, so a simple string is
+/// enough (no repo kind enum).
 pub struct State {
     pub client: Client,
-    pub mode: Option<RepoKind>,
-    pub repo_or_bucket: String,
+    pub bucket_id: String,
     pub cwd: String,
     pub ls_cache: HashMap<String, Vec<String>>,
 }
@@ -29,40 +31,29 @@ impl State {
     pub fn new(client: Client) -> Self {
         Self {
             client,
-            mode: None,
-            repo_or_bucket: String::new(),
+            bucket_id: String::new(),
             cwd: String::new(),
             ls_cache: HashMap::new(),
         }
     }
 
     fn is_opened(&self) -> bool {
-        self.mode.is_some()
+        !self.bucket_id.is_empty()
     }
 
-    fn ensure_bucket_mode(&self, op: &str) -> Result<()> {
-        match self.mode {
-            Some(RepoKind::Bucket) => Ok(()),
-            Some(_) => bail!("{}: not supported for read-only mode", op),
-            None => bail!("{}: nothing opened", op),
-        }
-    }
-
-    fn label(&self) -> String {
-        match self.mode {
-            Some(RepoKind::Bucket) => self.repo_or_bucket.clone(),
-            Some(RepoKind::Dataset) => format!("ds:{}", self.repo_or_bucket),
-            Some(RepoKind::Model) => format!("m:{}", self.repo_or_bucket),
-            None => String::new(),
+    fn ensure_opened(&self, op: &str) -> Result<()> {
+        if self.is_opened() {
+            Ok(())
+        } else {
+            bail!("{}: nothing opened", op)
         }
     }
 
     fn url_root(&self) -> String {
-        match self.mode {
-            Some(RepoKind::Bucket) => format!("hf://buckets/{}", self.repo_or_bucket),
-            Some(RepoKind::Dataset) => format!("hf://datasets/{}", self.repo_or_bucket),
-            Some(RepoKind::Model) => format!("hf://models/{}", self.repo_or_bucket),
-            None => "hf://".to_string(),
+        if self.is_opened() {
+            format!("hf://buckets/{}", self.bucket_id)
+        } else {
+            "hf://".to_string()
         }
     }
 
@@ -71,7 +62,7 @@ impl State {
             return "hf> ".to_string();
         }
         let shown = if self.cwd.is_empty() { String::new() } else { format!("/{}", self.cwd) };
-        format!("hf:{}{}> ", self.label(), shown)
+        format!("hf:{}{}> ", self.bucket_id, shown)
     }
 
     fn invalidate_cache(&mut self) {
@@ -93,24 +84,13 @@ impl State {
     }
 
     fn iter_tree(&self, rel_dir: &str, recursive: bool) -> Result<Vec<TreeEntry>> {
-        match self.mode {
-            Some(RepoKind::Bucket) => {
-                let prefix = if rel_dir.is_empty() { None } else { Some(rel_dir) };
-                let prefix_owned = prefix.map(|p| format!("{}/", p.trim_end_matches('/')));
-                self.client.list_bucket_tree(
-                    &self.repo_or_bucket,
-                    prefix_owned.as_deref(),
-                    recursive,
-                )
-            }
-            Some(kind @ (RepoKind::Dataset | RepoKind::Model)) => {
-                let rel = rel_dir.trim_end_matches('/');
-                let path_in_repo = if rel.is_empty() { None } else { Some(rel) };
-                self.client
-                    .list_repo_tree(kind, &self.repo_or_bucket, path_in_repo, recursive)
-            }
-            None => bail!("nothing opened"),
+        if !self.is_opened() {
+            bail!("nothing opened");
         }
+        let prefix = if rel_dir.is_empty() { None } else { Some(rel_dir) };
+        let prefix_owned = prefix.map(|p| format!("{}/", p.trim_end_matches('/')));
+        self.client
+            .list_bucket_tree(&self.bucket_id, prefix_owned.as_deref(), recursive)
     }
 
     /// Return immediate children of `rel_dir` as raw names (trailing `/` on dirs). Cached.
@@ -274,6 +254,100 @@ pub(crate) fn basename(p: &str) -> &str {
     p.rsplit('/').next().unwrap_or(p)
 }
 
+/// Where a `cp` / `mv` source physically lives. Originating repo dictates both
+/// how we fetch the xet hash and what `sourceRepoType` / `sourceRepoId` to send
+/// in the `/batch` NDJSON.
+#[derive(Debug, Clone)]
+enum SourceOrigin {
+    OpenedBucket,
+    External {
+        kind: RepoKind,
+        repo_id: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedSource {
+    origin: SourceOrigin,
+    path: String,
+    is_dir: bool,
+}
+
+/// A parsed `hf://{buckets,datasets,models}/<repo>/<path>` URL. `repo_id` is
+/// `<ns>/<name>` for buckets (always namespaced) or whatever the dataset/model
+/// id is otherwise. `path` is the file path inside that repo (never starts with
+/// `/`).
+#[derive(Debug)]
+pub(crate) struct HfUrl {
+    pub kind: RepoKind,
+    pub repo_id: String,
+    pub path: String,
+}
+
+/// Parse `hf://{buckets,datasets,models}/<id>/<path>`. Returns `Ok(None)` when
+/// `s` isn't an `hf://` URL (caller should treat it as a bucket-relative path),
+/// `Err` when it is an `hf://` URL but malformed.
+pub(crate) fn parse_hf_url(s: &str) -> Result<Option<HfUrl>> {
+    let Some(rest) = s.strip_prefix("hf://") else {
+        return Ok(None);
+    };
+    let (kind, after_prefix) = if let Some(r) = rest.strip_prefix("buckets/") {
+        (RepoKind::Bucket, r)
+    } else if let Some(r) = rest.strip_prefix("datasets/") {
+        (RepoKind::Dataset, r)
+    } else if let Some(r) = rest.strip_prefix("models/") {
+        (RepoKind::Model, r)
+    } else {
+        bail!("hf url: must start with hf://{{buckets,datasets,models}}/ (got {:?})", s);
+    };
+    // Buckets need `<ns>/<name>/<path>` — two slash-separated id components
+    // before the path. Datasets/models may be single-segment ids.
+    let (repo_id, path) = match kind {
+        RepoKind::Bucket => {
+            let mut it = after_prefix.splitn(3, '/');
+            let ns = it.next().unwrap_or("");
+            let name = it.next().unwrap_or("");
+            let path = it.next().unwrap_or("");
+            if ns.is_empty() || name.is_empty() {
+                bail!("hf url: bucket id must be <ns>/<name> (got {:?})", s);
+            }
+            (format!("{}/{}", ns, name), path.to_string())
+        }
+        RepoKind::Dataset | RepoKind::Model => {
+            // Dataset/model ids are either `<name>` (legacy, e.g. `squad`) or
+            // `<ns>/<name>` (modern, e.g. `HuggingFaceH4/zephyr-7b`). Given
+            // `after_prefix = <id>/<path>`:
+            //   - ≥2 slashes → id is the first two segments (modern form).
+            //   - exactly 1 slash → id is the first segment (legacy form).
+            // This gets single-segment-id-with-nested-path wrong (rare edge
+            // case — e.g. a `squad/nested/file.txt` would be misread as
+            // id=`squad/nested`), but that shape isn't in common use on the hub.
+            let slashes = after_prefix.matches('/').count();
+            match slashes {
+                0 => bail!("hf url: missing <path> after repo id (got {:?})", s),
+                1 => {
+                    let (id, path) = after_prefix.split_once('/').unwrap();
+                    if id.is_empty() || path.is_empty() {
+                        bail!("hf url: empty repo id or path (got {:?})", s);
+                    }
+                    (id.to_string(), path.to_string())
+                }
+                _ => {
+                    let mut it = after_prefix.splitn(3, '/');
+                    let ns = it.next().unwrap_or("");
+                    let name = it.next().unwrap_or("");
+                    let path = it.next().unwrap_or("");
+                    if ns.is_empty() || name.is_empty() || path.is_empty() {
+                        bail!("hf url: empty segment in {:?}", s);
+                    }
+                    (format!("{}/{}", ns, name), path.to_string())
+                }
+            }
+        }
+    };
+    Ok(Some(HfUrl { kind, repo_id, path }))
+}
+
 // ----------------------------------------------------------------------
 // Public shell dispatch: executes one line of REPL input.
 // ----------------------------------------------------------------------
@@ -312,6 +386,8 @@ impl Shell {
             "rm" => self.do_rm(rest)?,
             "mv" => self.do_mv(rest)?,
             "cp" => self.do_cp(rest)?,
+            "put" => self.do_put(rest)?,
+            "get" => self.do_get(rest)?,
             "refresh" => {
                 self.state.borrow_mut().invalidate_cache();
                 println!("cache cleared");
@@ -328,31 +404,23 @@ impl Shell {
     fn do_open(&mut self, arg: &str) -> Result<()> {
         let arg = arg.trim();
         if arg.is_empty() {
-            bail!("usage: open {{buckets|datasets|models}}/<ns>/<name>");
+            bail!("usage: open buckets/<ns>/<name>");
         }
-        let (kind, rest) = if let Some(r) = arg.strip_prefix("buckets/") {
-            (RepoKind::Bucket, r)
-        } else if let Some(r) = arg.strip_prefix("datasets/") {
-            (RepoKind::Dataset, r)
-        } else if let Some(r) = arg.strip_prefix("models/") {
-            (RepoKind::Model, r)
-        } else {
-            bail!(
-                "open: target must start with buckets/, datasets/, or models/ (got {:?})",
+        let rest = arg.strip_prefix("buckets/").ok_or_else(|| {
+            anyhow!(
+                "open: only buckets can be opened (got {:?}); to pull from a dataset/model, \
+                 use `cp hf://datasets/<id>/<path> <dst>` from an opened bucket",
                 arg
-            );
-        };
+            )
+        })?;
         if rest.is_empty() {
-            bail!("open: missing repo/bucket id after prefix (got {:?})", arg);
+            bail!("open: missing bucket id after `buckets/` (got {:?})", arg);
         }
-        // Buckets are always namespaced; datasets/models may be root-level
-        // (e.g. `squad`, `bert-base-uncased`).
-        if matches!(kind, RepoKind::Bucket) && !rest.contains('/') {
+        if !rest.contains('/') {
             bail!("open: buckets require <ns>/<name> (got {:?})", arg);
         }
         let mut st = self.state.borrow_mut();
-        st.mode = Some(kind);
-        st.repo_or_bucket = rest.to_string();
+        st.bucket_id = rest.to_string();
         st.cwd = String::new();
         st.invalidate_cache();
         Ok(())
@@ -472,22 +540,18 @@ impl Shell {
                 );
             }
         }
-        let kind = st.mode.ok_or_else(|| anyhow!("no mode"))?;
+        st.ensure_opened("cat")?;
         // Single-match cat only — batch concatenation with a 1 MiB cap is a
         // foot-gun (see CLAUDE.md).
-        let data = if matches!(kind, RepoKind::Bucket) {
-            let info = st
-                .client
-                .bucket_paths_info(&st.repo_or_bucket, &[rel.clone()])?
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow!("cat: {}: not found", rel))?;
-            st.client
-                .download_bucket_file(&st.repo_or_bucket, &info, CAT_MAX_SIZE)?
-        } else {
-            st.client
-                .download_repo_file(kind, &st.repo_or_bucket, &rel, CAT_MAX_SIZE)?
-        };
+        let info = st
+            .client
+            .bucket_paths_info(&st.bucket_id, std::slice::from_ref(&rel))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("cat: {}: not found", rel))?;
+        let data = st
+            .client
+            .download_bucket_file(&st.bucket_id, &info, CAT_MAX_SIZE)?;
         if data.len() as u64 > CAT_MAX_SIZE {
             bail!("cat: {}: exceeds {} limit", rel, fmt_size(Some(CAT_MAX_SIZE)));
         }
@@ -682,7 +746,7 @@ impl Shell {
     fn do_rm(&mut self, arg: &str) -> Result<()> {
         {
             let st = self.state.borrow();
-            st.ensure_bucket_mode("rm")?;
+            st.ensure_opened("rm")?;
         }
         let tokens = shell_words::split(arg).map_err(|e| anyhow!("parse error: {}", e))?;
         let recursive = tokens.iter().any(|t| t == "-r");
@@ -713,11 +777,11 @@ impl Shell {
         if to_delete.is_empty() {
             return Ok(());
         }
-        let bucket = self.state.borrow().repo_or_bucket.clone();
+        let bucket = self.state.borrow().bucket_id.clone();
         self.state
             .borrow()
             .client
-            .bucket_batch(&bucket, &[], &to_delete)?;
+            .bucket_batch(&bucket, &[], &[], &to_delete)?;
         for p in &to_delete {
             println!("removed {}", p);
         }
@@ -756,28 +820,62 @@ impl Shell {
         let dst_arg = &dst_arg[0];
         {
             let st = self.state.borrow();
-            st.ensure_bucket_mode(op)?;
+            st.ensure_opened(op)?;
         }
 
-        // Resolve sources, keeping is_dir info so we can expand dirs later.
-        let bucket = self.state.borrow().repo_or_bucket.clone();
-        let mut src_entries: Vec<(String, bool)> = Vec::new();
-        {
-            let st = self.state.borrow();
-            for s in srcs_args {
-                if has_glob_chars(s) {
-                    for e in st.glob_match(s)? {
-                        src_entries.push((e.path, e.is_dir));
-                    }
-                } else {
-                    let rel = st.remote_prefix(s);
-                    if rel.is_empty() {
-                        bail!("{}: cannot use root as a source", op);
-                    }
-                    match st.stat(&rel)? {
-                        Some((is_dir, _)) => src_entries.push((rel, is_dir)),
-                        None => bail!("{}: source not found: {}", op, rel),
-                    }
+        // Resolve sources, keeping is_dir + origin info so we can expand dirs
+        // and look up xet hashes from the right endpoint later. Sources fall
+        // into three buckets: (a) relative paths inside the opened bucket,
+        // (b) `hf://buckets/<other-ns>/<other>/path` external-bucket files,
+        // (c) `hf://{datasets,models}/<id>/path` external-repo files.
+        let bucket = self.state.borrow().bucket_id.clone();
+        let mut src_entries: Vec<ResolvedSource> = Vec::new();
+        for s in srcs_args {
+            if let Some(url) = parse_hf_url(s)? {
+                // External source. `mv` isn't allowed here — we don't own the
+                // source-side delete permission for foreign repos.
+                if delete_sources {
+                    bail!("{}: external sources (hf://...) can only be copied, not moved", op);
+                }
+                if has_glob_chars(&url.path) {
+                    bail!("{}: globs in hf:// sources aren't supported yet (use concrete paths)", op);
+                }
+                if url.path.is_empty() {
+                    bail!("{}: missing path in {:?}", op, s);
+                }
+                // We don't attempt to recursively expand external dirs either;
+                // that requires a second tree walk + per-file xet lookup.
+                // Concrete file paths only, for now.
+                src_entries.push(ResolvedSource {
+                    origin: SourceOrigin::External {
+                        kind: url.kind,
+                        repo_id: url.repo_id,
+                    },
+                    path: url.path,
+                    is_dir: false,
+                });
+            } else if has_glob_chars(s) {
+                let st = self.state.borrow();
+                for e in st.glob_match(s)? {
+                    src_entries.push(ResolvedSource {
+                        origin: SourceOrigin::OpenedBucket,
+                        path: e.path,
+                        is_dir: e.is_dir,
+                    });
+                }
+            } else {
+                let st = self.state.borrow();
+                let rel = st.remote_prefix(s);
+                if rel.is_empty() {
+                    bail!("{}: cannot use root as a source", op);
+                }
+                match st.stat(&rel)? {
+                    Some((is_dir, _)) => src_entries.push(ResolvedSource {
+                        origin: SourceOrigin::OpenedBucket,
+                        path: rel,
+                        is_dir,
+                    }),
+                    None => bail!("{}: source not found: {}", op, rel),
                 }
             }
         }
@@ -804,13 +902,14 @@ impl Shell {
             .borrow()
             .remote_prefix(dst_arg.trim_end_matches('/'));
 
-        // Expand each source (file or directory) to concrete (src_file, dst_file)
-        // pairs. For a directory we walk its files and mirror the subtree under
-        // the landing base.
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        for (src_path, is_dir) in &src_entries {
+        // Expand each source (file or directory) to concrete (origin, src_file,
+        // dst_file) triples. Own-bucket directories are walked so the subtree is
+        // mirrored under the landing base; external-source dirs are rejected
+        // upfront (see above).
+        let mut pairs: Vec<(SourceOrigin, String, String)> = Vec::new();
+        for entry in &src_entries {
             let landing = if dst_is_dir {
-                let leaf = basename(src_path);
+                let leaf = basename(&entry.path);
                 if dst_base.is_empty() {
                     leaf.to_string()
                 } else {
@@ -819,11 +918,11 @@ impl Shell {
             } else {
                 dst_base.clone()
             };
-            if *is_dir {
-                let prefix = format!("{}/", src_path);
+            if entry.is_dir {
+                let prefix = format!("{}/", entry.path);
                 let st = self.state.borrow();
                 let mut saw_file = false;
-                for e in st.iter_tree(src_path, true)? {
+                for e in st.iter_tree(&entry.path, true)? {
                     if e.is_dir {
                         continue;
                     }
@@ -834,55 +933,445 @@ impl Shell {
                     } else {
                         format!("{}/{}", landing, sub)
                     };
-                    pairs.push((e.path.clone(), dst));
+                    pairs.push((entry.origin.clone(), e.path.clone(), dst));
                 }
                 if !saw_file {
-                    bail!("{}: directory {:?} is empty", op, src_path);
+                    bail!("{}: directory {:?} is empty", op, entry.path);
                 }
             } else {
-                pairs.push((src_path.clone(), landing));
+                pairs.push((entry.origin.clone(), entry.path.clone(), landing));
             }
         }
 
-        // Fetch xet_hash for every (file) source in one paths-info call.
-        let src_paths: Vec<String> = pairs.iter().map(|(s, _)| s.clone()).collect();
-        let mut hashes: std::collections::HashMap<String, String> = {
-            let st = self.state.borrow();
-            st.client
-                .bucket_paths_info(&bucket, &src_paths)?
+        // Fetch xet_hash per source. Group own-bucket paths into one paths-info
+        // call; external files get one HEAD per file.
+        let own_bucket_paths: Vec<String> = pairs
+            .iter()
+            .filter(|(o, _, _)| matches!(o, SourceOrigin::OpenedBucket))
+            .map(|(_, s, _)| s.clone())
+            .collect();
+        let mut own_hashes: std::collections::HashMap<String, String> = if !own_bucket_paths.is_empty() {
+            self.state
+                .borrow()
+                .client
+                .bucket_paths_info(&bucket, &own_bucket_paths)?
                 .into_iter()
                 .map(|i| (i.path, i.xet_hash))
                 .collect()
+        } else {
+            std::collections::HashMap::new()
         };
+
         let mut copies: Vec<BucketCopyOp> = Vec::with_capacity(pairs.len());
-        for (src, dst) in &pairs {
-            let xet_hash = hashes
-                .remove(src)
-                .ok_or_else(|| anyhow!("{}: source not found: {}", op, src))?;
-            copies.push(BucketCopyOp {
-                source_repo_type: "bucket".into(),
-                source_repo_id: bucket.clone(),
-                xet_hash,
-                destination: dst.clone(),
-            });
+        for (origin, src, dst) in &pairs {
+            match origin {
+                SourceOrigin::OpenedBucket => {
+                    let xet_hash = own_hashes
+                        .remove(src)
+                        .ok_or_else(|| anyhow!("{}: source not found: {}", op, src))?;
+                    copies.push(BucketCopyOp {
+                        source_repo_type: "bucket".into(),
+                        source_repo_id: bucket.clone(),
+                        xet_hash,
+                        destination: dst.clone(),
+                    });
+                }
+                SourceOrigin::External { kind, repo_id } => {
+                    let info = match kind {
+                        RepoKind::Bucket => self
+                            .state
+                            .borrow()
+                            .client
+                            .bucket_paths_info(repo_id, std::slice::from_ref(src))?
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| anyhow!("{}: external source not found: {}", op, src))?,
+                        RepoKind::Dataset | RepoKind::Model => self
+                            .state
+                            .borrow()
+                            .client
+                            .repo_xet_info(*kind, repo_id, src)?,
+                    };
+                    copies.push(BucketCopyOp {
+                        source_repo_type: kind.repo_type_path().trim_end_matches('s').into(),
+                        source_repo_id: repo_id.clone(),
+                        xet_hash: info.xet_hash,
+                        destination: dst.clone(),
+                    });
+                }
+            }
         }
 
         let deletes: Vec<String> = if delete_sources {
-            pairs.iter().map(|(s, _)| s.clone()).collect()
+            // Only own-bucket sources can be deleted; external ones were refused
+            // upfront. Filter by origin so the check is local.
+            pairs
+                .iter()
+                .filter(|(o, _, _)| matches!(o, SourceOrigin::OpenedBucket))
+                .map(|(_, s, _)| s.clone())
+                .collect()
         } else {
             Vec::new()
         };
         self.state
             .borrow()
             .client
-            .bucket_batch(&bucket, &copies, &deletes)?;
+            .bucket_batch(&bucket, &[], &copies, &deletes)?;
         let verb = if delete_sources { "moved" } else { "copied" };
-        for (src, dst) in &pairs {
-            println!("{} {} -> {}", verb, src, dst);
+        for (origin, src, dst) in &pairs {
+            match origin {
+                SourceOrigin::OpenedBucket => println!("{} {} -> {}", verb, src, dst),
+                SourceOrigin::External { kind, repo_id } => println!(
+                    "copied hf://{}/{}/{} -> {}",
+                    kind.repo_type_path(),
+                    repo_id,
+                    src,
+                    dst
+                ),
+            }
         }
         self.state.borrow_mut().invalidate_cache();
         Ok(())
     }
+
+    /// `put <local-src>... <remote-dst>` — upload local files/dirs into the bucket.
+    ///
+    /// Destination rules mirror `cp` / `mv`:
+    /// - Trailing `/`, existing remote dir, or >1 source → directory mode; each
+    ///   source lands at `<dst>/<basename(src)>`.
+    /// - Otherwise, single source → rename: src lands at `<dst>`.
+    ///
+    /// Local directories are walked recursively; the subtree is preserved under
+    /// the landing base. Local globs (`*`, `?`, `[..]`) are expanded by the
+    /// shell's glob crate and must match at least one file.
+    fn do_put(&mut self, arg: &str) -> Result<()> {
+        {
+            let st = self.state.borrow();
+            st.ensure_opened("put")?;
+        }
+        let tokens = shell_words::split(arg).map_err(|e| anyhow!("parse error: {}", e))?;
+        if tokens.len() < 2 {
+            bail!("put: usage: put <local-src>... <remote-dst>");
+        }
+        let (srcs_args, dst_arg) = tokens.split_at(tokens.len() - 1);
+        let dst_arg = &dst_arg[0];
+
+        // Expand local sources: each arg may be a literal file/dir or a glob.
+        // `~` / `~/foo` is expanded to the user's home before globbing/stat.
+        let mut sources: Vec<std::path::PathBuf> = Vec::new();
+        for s in srcs_args {
+            let expanded = expand_tilde(s);
+            let s_fs = expanded.as_ref();
+            if has_glob_chars(s_fs) {
+                let mut matched = false;
+                for entry in glob::glob(s_fs).map_err(|e| anyhow!("bad glob {:?}: {}", s, e))? {
+                    let p = entry.map_err(|e| anyhow!("glob: {}", e))?;
+                    matched = true;
+                    sources.push(p);
+                }
+                if !matched {
+                    bail!("put: no match: {}", s);
+                }
+            } else {
+                let p = std::path::PathBuf::from(s_fs);
+                if !p.exists() {
+                    bail!("put: local source not found: {}", p.display());
+                }
+                sources.push(p);
+            }
+        }
+        if sources.is_empty() {
+            bail!("put: no sources");
+        }
+
+        // Decide dst semantics identical to mv/cp.
+        let st_ref = self.state.borrow();
+        let dst_rel = st_ref.remote_prefix(dst_arg.trim_end_matches('/'));
+        let dst_is_dir = dst_arg.ends_with('/')
+            || matches!(st_ref.stat(&dst_rel)?, Some((true, _)))
+            || sources.len() > 1
+            || sources.iter().any(|p| p.is_dir());
+        drop(st_ref);
+        if sources.len() > 1 && !dst_is_dir {
+            bail!("put: target {:?} is not a directory", dst_arg);
+        }
+
+        // Build (local_path, remote_path) pairs, walking directories.
+        let mut pairs: Vec<(std::path::PathBuf, String)> = Vec::new();
+        for src in &sources {
+            let landing = if dst_is_dir {
+                let leaf = src
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| anyhow!("put: cannot use {} as a source", src.display()))?;
+                if dst_rel.is_empty() {
+                    leaf.to_string()
+                } else {
+                    format!("{}/{}", dst_rel, leaf)
+                }
+            } else {
+                dst_rel.clone()
+            };
+            if src.is_dir() {
+                let mut saw_file = false;
+                walk_local_dir(src, &mut |file, sub| {
+                    saw_file = true;
+                    let dst = if landing.is_empty() {
+                        sub.to_string()
+                    } else {
+                        format!("{}/{}", landing, sub)
+                    };
+                    pairs.push((file.to_path_buf(), dst));
+                })?;
+                if !saw_file {
+                    bail!("put: directory {:?} is empty", src.display().to_string());
+                }
+            } else if src.is_file() {
+                pairs.push((src.clone(), landing));
+            } else {
+                bail!("put: unsupported source type: {}", src.display());
+            }
+        }
+
+        let bucket = self.state.borrow().bucket_id.clone();
+        let total_bytes: u64 = pairs
+            .iter()
+            .filter_map(|(p, _)| std::fs::metadata(p).ok().map(|m| m.len()))
+            .sum();
+        let bar = ProgressBar::new(
+            format!("uploading {} file{}", pairs.len(), if pairs.len() == 1 { "" } else { "s" }),
+            total_bytes,
+        );
+        let upload_result = self
+            .state
+            .borrow()
+            .client
+            .xet_upload_files(&bucket, &pairs, Some(bar.handle()));
+        bar.finish();
+        let uploaded = upload_result?;
+        let mut adds: Vec<BucketAddOp> = Vec::with_capacity(uploaded.len());
+        for (info, (local, _)) in uploaded.iter().zip(pairs.iter()) {
+            let mtime_ms = std::fs::metadata(local)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or_else(|| {
+                    (chrono::Utc::now().timestamp_millis()).max(0)
+                });
+            adds.push(BucketAddOp {
+                destination: info.remote_path.clone(),
+                xet_hash: info.xet_hash.clone(),
+                mtime_ms,
+                content_type: guess_content_type(&info.remote_path),
+            });
+        }
+        self.state
+            .borrow()
+            .client
+            .bucket_batch(&bucket, &adds, &[], &[])?;
+        for ((local, _), info) in pairs.iter().zip(uploaded.iter()) {
+            println!(
+                "uploaded {} -> {} ({} bytes)",
+                local.display(),
+                info.remote_path,
+                info.size
+            );
+        }
+        self.state.borrow_mut().invalidate_cache();
+        Ok(())
+    }
+
+    /// `get <remote-src>... [<local-dst>]` — download from the opened bucket
+    /// to the local filesystem. `<local-dst>` defaults to `.`. Directory
+    /// destinations (trailing `/`, existing dir, or >1 source) cause each
+    /// source to land at `<dst>/<basename(src)>`; otherwise the single source
+    /// is renamed to `<dst>`. Remote directories are expanded recursively and
+    /// mirror their subtree locally.
+    fn do_get(&mut self, arg: &str) -> Result<()> {
+        {
+            let st = self.state.borrow();
+            st.ensure_opened("get")?;
+        }
+        let tokens = shell_words::split(arg).map_err(|e| anyhow!("parse error: {}", e))?;
+        if tokens.is_empty() {
+            bail!("get: usage: get <remote-src>... [<local-dst>]");
+        }
+        let (srcs_args, dst_arg): (Vec<String>, String) = if tokens.len() == 1 {
+            (tokens.clone(), ".".to_string())
+        } else {
+            let last = tokens.last().unwrap().clone();
+            (tokens[..tokens.len() - 1].to_vec(), last)
+        };
+
+        // Resolve remote sources (glob + stat), collecting (abs_remote_path, is_dir).
+        let mut src_entries: Vec<(String, bool)> = Vec::new();
+        {
+            let st = self.state.borrow();
+            for s in &srcs_args {
+                if has_glob_chars(s) {
+                    for e in st.glob_match(s)? {
+                        src_entries.push((e.path, e.is_dir));
+                    }
+                } else {
+                    let rel = st.remote_prefix(s);
+                    match st.stat(&rel)? {
+                        Some((is_dir, _)) => src_entries.push((rel, is_dir)),
+                        None => bail!("get: remote source not found: {}", rel),
+                    }
+                }
+            }
+        }
+        if src_entries.is_empty() {
+            bail!("get: no sources");
+        }
+
+        let dst_path = std::path::PathBuf::from(expand_tilde(&dst_arg).as_ref());
+        let dst_is_dir = dst_arg.ends_with('/')
+            || dst_arg == "."
+            || dst_arg == ".."
+            || dst_path.is_dir()
+            || src_entries.len() > 1
+            || src_entries.iter().any(|(_, d)| *d);
+        if src_entries.len() > 1 && !dst_is_dir {
+            bail!("get: target {:?} is not a directory", dst_arg);
+        }
+
+        // Expand into (remote_file_rel, local_file_path) pairs.
+        let mut pairs: Vec<(String, std::path::PathBuf)> = Vec::new();
+        let st = self.state.borrow();
+        for (src_path, is_dir) in &src_entries {
+            let landing: std::path::PathBuf = if dst_is_dir {
+                let leaf = basename(src_path);
+                if leaf.is_empty() {
+                    bail!("get: cannot infer filename for {:?}", src_path);
+                }
+                dst_path.join(leaf)
+            } else {
+                dst_path.clone()
+            };
+            if *is_dir {
+                let prefix = format!("{}/", src_path);
+                let mut saw_file = false;
+                for e in st.iter_tree(src_path, true)? {
+                    if e.is_dir {
+                        continue;
+                    }
+                    saw_file = true;
+                    let sub = e.path.strip_prefix(&prefix).unwrap_or(&e.path);
+                    pairs.push((e.path.clone(), landing.join(sub.replace('/', std::path::MAIN_SEPARATOR_STR))));
+                }
+                if !saw_file {
+                    bail!("get: directory {:?} is empty", src_path);
+                }
+            } else {
+                pairs.push((src_path.clone(), landing));
+            }
+        }
+        let bucket_id = st.bucket_id.clone();
+        drop(st);
+
+        // Resolve xet metadata for every remote file in one call.
+        let remote_paths: Vec<String> = pairs.iter().map(|(r, _)| r.clone()).collect();
+        let infos = self
+            .state
+            .borrow()
+            .client
+            .bucket_paths_info(&bucket_id, &remote_paths)?;
+        let mut by_path: std::collections::HashMap<String, BucketPathInfo> =
+            infos.into_iter().map(|i| (i.path.clone(), i)).collect();
+        let mut downloads: Vec<(BucketPathInfo, std::path::PathBuf)> =
+            Vec::with_capacity(pairs.len());
+        for (rem, loc) in &pairs {
+            let info = by_path
+                .remove(rem)
+                .ok_or_else(|| anyhow!("get: remote file not found: {}", rem))?;
+            downloads.push((info, loc.clone()));
+        }
+        let total_bytes: u64 = downloads.iter().filter_map(|(i, _)| i.size).sum();
+        let n = downloads.len();
+        let bar = ProgressBar::new(
+            format!("downloading {} file{}", n, if n == 1 { "" } else { "s" }),
+            total_bytes,
+        );
+        let result = self.state.borrow().client.download_bucket_files_to_paths(
+            &bucket_id,
+            &downloads,
+            Some(bar.handle()),
+        );
+        bar.finish();
+        result?;
+        for (info, loc) in &downloads {
+            println!(
+                "downloaded {} -> {} ({} bytes)",
+                info.path,
+                loc.display(),
+                info.size.unwrap_or(0)
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Walk `root` recursively, calling `cb(file_path, posix_rel_path)` for every
+/// regular file encountered. `posix_rel_path` is relative to `root` and uses
+/// `/` separators regardless of platform, ready for use as a remote path
+/// segment.
+fn walk_local_dir(
+    root: &std::path::Path,
+    cb: &mut dyn FnMut(&std::path::Path, &str),
+) -> Result<()> {
+    fn inner(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        cb: &mut dyn FnMut(&std::path::Path, &str),
+    ) -> Result<()> {
+        for entry in std::fs::read_dir(dir)
+            .with_context(|| format!("read_dir {}", dir.display()))?
+        {
+            let entry = entry.with_context(|| format!("read_dir entry in {}", dir.display()))?;
+            let path = entry.path();
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                inner(root, &path, cb)?;
+            } else if ft.is_file() {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                cb(&path, &rel);
+            }
+            // symlinks, sockets, etc. silently skipped.
+        }
+        Ok(())
+    }
+    inner(root, root, cb)
+}
+
+/// Cheap `mimetypes.guess_type`-style lookup for the handful of common types
+/// a user actually uploads from the REPL. Returns `None` for unknowns; the
+/// server fills in `application/octet-stream` by default.
+fn guess_content_type(remote_path: &str) -> Option<String> {
+    let ext = remote_path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase())?;
+    let ct = match ext.as_str() {
+        "json" => "application/json",
+        "txt" | "log" | "md" | "csv" | "tsv" => "text/plain",
+        "html" | "htm" => "text/html",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "gz" => "application/gzip",
+        "zip" => "application/zip",
+        "tar" => "application/x-tar",
+        "parquet" => "application/vnd.apache.parquet",
+        "safetensors" => "application/octet-stream",
+        "bin" | "pt" | "pth" | "ckpt" | "onnx" => "application/octet-stream",
+        _ => return None,
+    };
+    Some(ct.to_string())
 }
 
 // ----------------------------------------------------------------------
@@ -935,9 +1424,7 @@ pub(crate) fn split_cmd(line: &str) -> (&str, &str) {
 
 fn print_help() {
     println!("commands:");
-    println!("  open buckets/<ns>/<name>     bucket (read/write)");
-    println!("  open datasets/<repo>         dataset (read-only)");
-    println!("  open models/<repo>           model (read-only)");
+    println!("  open buckets/<ns>/<name>     open a bucket (read/write)");
     println!("  cd <path> | cd .. | cd /     change dir (. / .. / / / absolute paths OK)");
     println!("  ls [path]                    list");
     println!("  pwd                          print hf:// URL");
@@ -946,8 +1433,11 @@ fn print_help() {
     println!("  find [path]                  recursive path dump");
     println!("  tree [-L N] [path]           tree view");
     println!("  rm [-r] <path>…              delete (bucket only)");
-    println!("  mv <src>... <dst>            move files/dirs (bucket only; dst must be dir for multi-src)");
-    println!("  cp <src>... <dst>            copy files/dirs (bucket only; same rules as mv)");
+    println!("  mv <src>... <dst>            move files/dirs within the bucket (dst must be dir for multi-src)");
+    println!("  cp <src>... <dst>            copy files/dirs; <src> can be an hf://{{buckets,datasets,models}}/…");
+    println!("                                 URL for server-side xet copy from another repo");
+    println!("  put <local-src>... <dst>     upload local files/dirs into bucket");
+    println!("  get <remote-src>... [<dst>]  download remote files/dirs to local fs (default: .)");
     println!("  refresh                      clear completion cache");
     println!("  exit | quit                  leave the shell");
     println!();
@@ -971,8 +1461,8 @@ impl Highlighter for ShellHelper {}
 impl Validator for ShellHelper {}
 
 const COMMANDS: &[&str] = &[
-    "open", "cd", "pwd", "ls", "cat", "du", "find", "tree", "rm", "mv", "cp", "refresh", "help",
-    "exit", "quit",
+    "open", "cd", "pwd", "ls", "cat", "du", "find", "tree", "rm", "mv", "cp", "put", "get",
+    "refresh", "help", "exit", "quit",
 ];
 
 impl Completer for ShellHelper {
@@ -1012,13 +1502,94 @@ impl Completer for ShellHelper {
                 all.retain(|p| p.replacement.ends_with('/'));
                 all
             }
-            "ls" | "cat" | "du" | "find" | "tree" | "rm" | "mv" | "cp" => {
+            "ls" | "cat" | "du" | "find" | "tree" | "rm" => {
                 complete_remote_path(&self.state, token)
             }
+            "mv" | "cp" => {
+                // `cp` / `mv` sources accept either a bucket-relative path or
+                // an `hf://{buckets,datasets,models}/<id>[/<path>]` external URL.
+                // Destinations are always bucket-relative, but while the user
+                // is still typing we can't tell which token is "last", so both
+                // kinds of candidates are offered (the relevant one wins).
+                if token.starts_with("hf://") || "hf://".starts_with(token) {
+                    complete_hf_url(&self.state, token)
+                } else {
+                    complete_remote_path(&self.state, token)
+                }
+            }
+            "get" => {
+                // `get <remote-src>... <local-dst>` — first positional arg is
+                // the src (remote), subsequent ones favour the local dst. Can't
+                // know for sure which token is "last" while the user is still
+                // typing, so multi-src middle args will mis-complete; that's a
+                // rarer workflow than the common `get <remote> <local>` pair.
+                let arg_index = prefix.split_whitespace().count().saturating_sub(1);
+                if arg_index == 0 {
+                    complete_remote_path(&self.state, token)
+                } else {
+                    complete_local_path(token)
+                }
+            }
+            "put" => complete_local_path(token),
             _ => Vec::new(),
         };
         Ok((start, candidates))
     }
+}
+
+fn complete_local_path(text: &str) -> Vec<Pair> {
+    // Bare "~" is rare but convenient — offer "~/" as the single candidate so
+    // the next keystroke starts listing $HOME.
+    if text == "~" {
+        return vec![Pair { display: "~/".into(), replacement: "~/".into() }];
+    }
+    let (dir_part, prefix) = match text.rsplit_once('/') {
+        Some((d, p)) => (if d.is_empty() { "/" } else { d }, p),
+        None => (".", text),
+    };
+    // Expand `~` for filesystem access but leave `text` (and therefore `head`
+    // below) alone, so the replacement keeps the user's typed form.
+    let fs_dir = expand_tilde(dir_part);
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(fs_dir.as_ref()) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let head = if text.contains('/') {
+            let idx = text.rfind('/').unwrap() + 1;
+            &text[..idx]
+        } else {
+            ""
+        };
+        let suffix = if is_dir { "/" } else { "" };
+        let replacement = format!("{}{}{}", head, name, suffix);
+        let display = format!("{}{}", name, suffix);
+        out.push(Pair { display, replacement });
+    }
+    out
+}
+
+/// Expand a leading `~` / `~/` to the user's home directory. Everything else
+/// is returned unchanged (borrowed, so no allocation on the common path).
+/// `~user` is intentionally not supported — a REPL is unlikely to need it.
+pub(crate) fn expand_tilde(s: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            let home = home.to_string_lossy();
+            return std::borrow::Cow::Owned(format!("{}/{}", home.trim_end_matches('/'), rest));
+        }
+    } else if s == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return std::borrow::Cow::Owned(home.to_string_lossy().into_owned());
+        }
+    }
+    std::borrow::Cow::Borrowed(s)
 }
 
 fn complete_remote_path(state: &Rc<RefCell<State>>, text: &str) -> Vec<Pair> {
@@ -1042,31 +1613,72 @@ fn complete_remote_path(state: &Rc<RefCell<State>>, text: &str) -> Vec<Pair> {
         .collect()
 }
 
-fn complete_open(state: &Rc<RefCell<State>>, text: &str) -> Vec<Pair> {
+/// Tab-complete `hf://{buckets,datasets,models}/<id>` URLs for `cp` / `mv`
+/// sources. We stop at the repo id — path-inside-repo completion would require
+/// another API round-trip per keystroke and a cache, which isn't worth the
+/// complexity right now. Users type the path after the id by hand.
+fn complete_hf_url(state: &Rc<RefCell<State>>, text: &str) -> Vec<Pair> {
     let client = &state.borrow().client;
     let mut results: Vec<Pair> = Vec::new();
-    if let Some(q) = text.strip_prefix("datasets/") {
+
+    // `hf://` itself — offer the three subtypes.
+    if text == "hf://" || "hf://".starts_with(text) {
+        let prefixes = ["hf://buckets/", "hf://datasets/", "hf://models/"];
+        // If the user has typed a partial `hf://`, offer just the scheme; once
+        // they complete `hf://` we can offer the three subtypes.
+        if text.len() < "hf://".len() {
+            results.push(Pair {
+                display: "hf://".into(),
+                replacement: "hf://".into(),
+            });
+            return results;
+        }
+        for p in prefixes {
+            results.push(Pair { display: p.into(), replacement: p.into() });
+        }
+        return results;
+    }
+
+    // Past `hf://<kind>/` — complete repo/bucket ids.
+    if let Some(q) = text.strip_prefix("hf://datasets/") {
         if let Ok(ids) = client.list_datasets(if q.is_empty() { None } else { Some(q) }, 30) {
             for id in ids {
                 if id.starts_with(q) {
-                    let s = format!("datasets/{}", id);
+                    let s = format!("hf://datasets/{}/", id);
                     results.push(Pair { display: s.clone(), replacement: s });
                 }
             }
         }
         return results;
     }
-    if let Some(q) = text.strip_prefix("models/") {
+    if let Some(q) = text.strip_prefix("hf://models/") {
         if let Ok(ids) = client.list_models(if q.is_empty() { None } else { Some(q) }, 30) {
             for id in ids {
                 if id.starts_with(q) {
-                    let s = format!("models/{}", id);
+                    let s = format!("hf://models/{}/", id);
                     results.push(Pair { display: s.clone(), replacement: s });
                 }
             }
         }
         return results;
     }
+    if let Some(q) = text.strip_prefix("hf://buckets/") {
+        if let Ok(buckets) = client.list_buckets(None) {
+            for b in buckets {
+                if b.starts_with(q) {
+                    let s = format!("hf://buckets/{}/", b);
+                    results.push(Pair { display: s.clone(), replacement: s });
+                }
+            }
+        }
+        return results;
+    }
+    results
+}
+
+fn complete_open(state: &Rc<RefCell<State>>, text: &str) -> Vec<Pair> {
+    let client = &state.borrow().client;
+    let mut results: Vec<Pair> = Vec::new();
     if let Some(q) = text.strip_prefix("buckets/") {
         // Buckets in the user's namespace (requires a token).
         if let Ok(buckets) = client.list_buckets(None) {
@@ -1079,10 +1691,8 @@ fn complete_open(state: &Rc<RefCell<State>>, text: &str) -> Vec<Pair> {
         }
         return results;
     }
-    for hint in &["buckets/", "datasets/", "models/"] {
-        if hint.starts_with(text) {
-            results.push(Pair { display: (*hint).to_string(), replacement: (*hint).to_string() });
-        }
+    if "buckets/".starts_with(text) {
+        results.push(Pair { display: "buckets/".into(), replacement: "buckets/".into() });
     }
     results
 }
@@ -1147,5 +1757,114 @@ mod tests {
         let q = glob::Pattern::new("*.parquet").unwrap();
         assert!(q.matches("train-00000-of-00001.parquet"));
         assert!(!q.matches("README.md"));
+    }
+
+    #[test]
+    fn guess_content_type_known_extensions() {
+        assert_eq!(guess_content_type("a/b/x.json").as_deref(), Some("application/json"));
+        assert_eq!(guess_content_type("README.md").as_deref(), Some("text/plain"));
+        assert_eq!(guess_content_type("pic.JPG").as_deref(), Some("image/jpeg"));
+        assert_eq!(
+            guess_content_type("weights.safetensors").as_deref(),
+            Some("application/octet-stream")
+        );
+    }
+
+    #[test]
+    fn guess_content_type_unknown_returns_none() {
+        assert_eq!(guess_content_type("weights"), None);
+        assert_eq!(guess_content_type("archive.xyz"), None);
+    }
+
+    #[test]
+    fn expand_tilde_leaves_non_tilde_borrowed() {
+        let s = "foo/bar";
+        assert_eq!(expand_tilde(s).as_ref(), "foo/bar");
+        assert!(matches!(expand_tilde(s), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn expand_tilde_rewrites_prefix_only() {
+        // We can only exercise this if $HOME is set; on CI runners it always is.
+        if dirs::home_dir().is_none() {
+            return;
+        }
+        let home = dirs::home_dir().unwrap().to_string_lossy().into_owned();
+        let home = home.trim_end_matches('/').to_string();
+        assert_eq!(expand_tilde("~").as_ref(), home);
+        assert_eq!(expand_tilde("~/x/y").as_ref(), format!("{}/x/y", home));
+        // No trailing-tilde expansion (unlike shells, we don't touch mid-path tildes).
+        assert_eq!(expand_tilde("./~/y").as_ref(), "./~/y");
+        assert_eq!(expand_tilde("~user/x").as_ref(), "~user/x");
+    }
+
+    #[test]
+    fn parse_hf_url_bucket_needs_ns_and_name() {
+        let u = parse_hf_url("hf://buckets/alice/my-bucket/path/to/file").unwrap().unwrap();
+        assert_eq!(u.kind, RepoKind::Bucket);
+        assert_eq!(u.repo_id, "alice/my-bucket");
+        assert_eq!(u.path, "path/to/file");
+
+        // Path can be empty — for use in directory-style listing/completion.
+        let u = parse_hf_url("hf://buckets/alice/b").unwrap().unwrap();
+        assert_eq!(u.repo_id, "alice/b");
+        assert_eq!(u.path, "");
+
+        // Missing name → error.
+        assert!(parse_hf_url("hf://buckets/alice").is_err());
+        assert!(parse_hf_url("hf://buckets//").is_err());
+    }
+
+    #[test]
+    fn parse_hf_url_dataset_legacy_single_segment_id() {
+        let u = parse_hf_url("hf://datasets/squad/train.parquet").unwrap().unwrap();
+        assert_eq!(u.kind, RepoKind::Dataset);
+        assert_eq!(u.repo_id, "squad");
+        assert_eq!(u.path, "train.parquet");
+    }
+
+    #[test]
+    fn parse_hf_url_dataset_modern_two_segment_id_with_nested_path() {
+        let u = parse_hf_url("hf://datasets/HuggingFaceH4/zephyr-7b/data/train.parquet")
+            .unwrap()
+            .unwrap();
+        assert_eq!(u.kind, RepoKind::Dataset);
+        assert_eq!(u.repo_id, "HuggingFaceH4/zephyr-7b");
+        assert_eq!(u.path, "data/train.parquet");
+    }
+
+    #[test]
+    fn parse_hf_url_model_two_segment() {
+        let u = parse_hf_url("hf://models/meta-llama/Llama-3.1-8B/config.json")
+            .unwrap()
+            .unwrap();
+        assert_eq!(u.kind, RepoKind::Model);
+        assert_eq!(u.repo_id, "meta-llama/Llama-3.1-8B");
+        assert_eq!(u.path, "config.json");
+    }
+
+    #[test]
+    fn parse_hf_url_rejects_unknown_scheme_and_non_hf_text() {
+        assert!(parse_hf_url("s3://bucket/x").unwrap().is_none()); // no hf:// → returns None
+        assert!(parse_hf_url("relative/path").unwrap().is_none());
+        // hf:// with unknown kind → error
+        assert!(parse_hf_url("hf://spaces/x/y").is_err());
+    }
+
+    #[test]
+    fn walk_local_dir_yields_posix_relative_paths() {
+        let tmp = std::env::temp_dir().join(format!("hfsh-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("a/b")).unwrap();
+        std::fs::write(tmp.join("top.txt"), "x").unwrap();
+        std::fs::write(tmp.join("a/mid.bin"), "x").unwrap();
+        std::fs::write(tmp.join("a/b/leaf.log"), "x").unwrap();
+
+        let mut found: Vec<String> = Vec::new();
+        walk_local_dir(&tmp, &mut |_p, rel| found.push(rel.to_string())).unwrap();
+        found.sort();
+        assert_eq!(found, vec!["a/b/leaf.log", "a/mid.bin", "top.txt"]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

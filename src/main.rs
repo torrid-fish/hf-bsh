@@ -1,5 +1,6 @@
 mod api;
 mod fmt;
+mod progress;
 mod shell;
 
 use std::io::{BufRead, IsTerminal};
@@ -15,15 +16,19 @@ use crate::api::Client;
 use crate::shell::{Shell, ShellHelper};
 
 const USAGE: &str = "\
-hfsh — an interactive shell for the Hugging Face Hub.
+hf-bsh — interactive bucket shell for the Hugging Face Hub.
 
 Usage:
-  hfsh [options] [<target>]
+  hf-bsh [options] [<target>]
+  hf bsh [options] [<target>]            (when installed as an `hf` extension)
 
 Target:
-  buckets/<ns>/<name>        bucket (read/write: rm/mv/cp supported)
-  datasets/<ns>/<name>       dataset (read-only)
-  models/<ns>/<name>         model (read-only)
+  buckets/<ns>/<name>        bucket to open (read/write)
+
+External sources for `cp`:
+  hf://buckets/<ns>/<name>/<path>        other bucket (server-side xet copy)
+  hf://datasets/<repo>/<path>            dataset file (server-side xet copy)
+  hf://models/<repo>/<path>              model file   (server-side xet copy)
 
 Options:
   --endpoint <URL>           override Hub endpoint (or set $HF_ENDPOINT)
@@ -52,7 +57,7 @@ fn parse_args() -> Result<CliArgs, String> {
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                println!("hfsh {}", env!("CARGO_PKG_VERSION"));
+                println!("hf-bsh {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "--endpoint" => {
@@ -82,7 +87,7 @@ fn parse_args() -> Result<CliArgs, String> {
 }
 
 fn history_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".hfsh_history"))
+    dirs::home_dir().map(|h| h.join(".hf-bsh_history"))
 }
 
 fn run_batch(mut shell: Shell) {
@@ -92,7 +97,7 @@ fn run_batch(mut shell: Shell) {
         match shell.run_line(&line) {
             Ok(true) => break,
             Ok(false) => {}
-            Err(e) => eprintln!("hfsh: {}", e),
+            Err(e) => eprintln!("hf-bsh: {}", e),
         }
     }
 }
@@ -101,7 +106,7 @@ fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("hfsh: {}\n\n{}", e, USAGE);
+            eprintln!("hf-bsh: {}\n\n{}", e, USAGE);
             return ExitCode::from(2);
         }
     };
@@ -111,7 +116,7 @@ fn main() -> ExitCode {
 
     if let Some(target) = args.target {
         if let Err(e) = shell.run_line(&format!("open {}", target)) {
-            eprintln!("hfsh: {}", e);
+            eprintln!("hf-bsh: {}", e);
         }
     }
 
@@ -121,7 +126,7 @@ fn main() -> ExitCode {
     }
 
     println!(
-        "hfsh {} — type `help` for commands.\n  open buckets/<ns>/<name>      bucket (read/write)\n  open datasets/<ns>/<name>     dataset (read-only)\n  open models/<ns>/<name>       model   (read-only)",
+        "hf-bsh {} — type `help` for commands.\n  open buckets/<ns>/<name>      bucket (read/write)\n  cp hf://datasets/<id>/<path>  <dst>/   pull external data in",
         env!("CARGO_PKG_VERSION")
     );
 
@@ -129,7 +134,7 @@ fn main() -> ExitCode {
     let mut rl: Editor<ShellHelper, rustyline::history::FileHistory> = match Editor::new() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("hfsh: failed to init readline: {}", e);
+            eprintln!("hf-bsh: failed to init readline: {}", e);
             return ExitCode::from(1);
         }
     };
@@ -149,7 +154,7 @@ fn main() -> ExitCode {
                 match shell.run_line(&line) {
                     Ok(true) => break,
                     Ok(false) => {}
-                    Err(e) => eprintln!("hfsh: {}", e),
+                    Err(e) => eprintln!("hf-bsh: {}", e),
                 }
             }
             Err(ReadlineError::Interrupted) => {
@@ -158,7 +163,7 @@ fn main() -> ExitCode {
             }
             Err(ReadlineError::Eof) => break,
             Err(e) => {
-                eprintln!("hfsh: readline: {}", e);
+                eprintln!("hf-bsh: readline: {}", e);
                 break;
             }
         }
