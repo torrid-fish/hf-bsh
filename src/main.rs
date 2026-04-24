@@ -23,7 +23,7 @@ Usage:
   hf bsh [options] [<target>]            (when installed as an `hf` extension)
 
 Target:
-  buckets/<ns>/<name>        bucket to open (read/write)
+  <ns>/<name>                bucket to open (read/write)
 
 External sources for `cp`:
   hf://buckets/<ns>/<name>/<path>        other bucket (server-side xet copy)
@@ -126,7 +126,7 @@ fn main() -> ExitCode {
     }
 
     println!(
-        "hf-bsh {} — type `help` for commands.\n  open buckets/<ns>/<name>      bucket (read/write)\n  cp hf://datasets/<id>/<path>  <dst>/   pull external data in",
+        "hf-bsh {} — type `help` for commands.\n  open <ns>/<name>              bucket (read/write)\n  cp hf://datasets/<id>/<path>  <dst>/   pull external data in",
         env!("CARGO_PKG_VERSION")
     );
 

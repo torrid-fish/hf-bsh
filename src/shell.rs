@@ -404,19 +404,36 @@ impl Shell {
     fn do_open(&mut self, arg: &str) -> Result<()> {
         let arg = arg.trim();
         if arg.is_empty() {
-            bail!("usage: open buckets/<ns>/<name>");
+            bail!("usage: open <ns>/<name>");
         }
-        let rest = arg.strip_prefix("buckets/").ok_or_else(|| {
-            anyhow!(
-                "open: only buckets can be opened (got {:?}); to pull from a dataset/model, \
-                 use `cp hf://datasets/<id>/<path> <dst>` from an opened bucket",
-                arg
-            )
-        })?;
-        if rest.is_empty() {
-            bail!("open: missing bucket id after `buckets/` (got {:?})", arg);
+        // Reject obviously wrong repo kinds up front — datasets/models can't be
+        // opened, they can only appear as `cp hf://…` sources.
+        if let Some(rest) = arg.strip_prefix("hf://") {
+            bail!(
+                "open: target must be a bucket id (got {:?}); `hf://…` URLs are \
+                 only valid as `cp` sources",
+                rest
+            );
         }
-        if !rest.contains('/') {
+        for bad in ["datasets/", "models/"] {
+            if let Some(rest) = arg.strip_prefix(bad) {
+                bail!(
+                    "open: only buckets can be opened (got {:?}); to pull from a \
+                     dataset/model, use `cp hf://{}{} <dst>` from an opened bucket",
+                    arg,
+                    bad,
+                    rest
+                );
+            }
+        }
+        // Back-compat: `buckets/<ns>/<name>` still works; the canonical form is
+        // now just `<ns>/<name>`.
+        let rest = arg.strip_prefix("buckets/").unwrap_or(arg);
+        let mut parts = rest.splitn(3, '/');
+        let ns = parts.next().unwrap_or("");
+        let name = parts.next().unwrap_or("");
+        let extra = parts.next();
+        if ns.is_empty() || name.is_empty() || extra.is_some() {
             bail!("open: buckets require <ns>/<name> (got {:?})", arg);
         }
         let mut st = self.state.borrow_mut();
@@ -1424,7 +1441,7 @@ pub(crate) fn split_cmd(line: &str) -> (&str, &str) {
 
 fn print_help() {
     println!("commands:");
-    println!("  open buckets/<ns>/<name>     open a bucket (read/write)");
+    println!("  open <ns>/<name>             open a bucket (read/write)");
     println!("  cd <path> | cd .. | cd /     change dir (. / .. / / / absolute paths OK)");
     println!("  ls [path]                    list");
     println!("  pwd                          print hf:// URL");
@@ -1679,20 +1696,20 @@ fn complete_hf_url(state: &Rc<RefCell<State>>, text: &str) -> Vec<Pair> {
 fn complete_open(state: &Rc<RefCell<State>>, text: &str) -> Vec<Pair> {
     let client = &state.borrow().client;
     let mut results: Vec<Pair> = Vec::new();
-    if let Some(q) = text.strip_prefix("buckets/") {
-        // Buckets in the user's namespace (requires a token).
-        if let Ok(buckets) = client.list_buckets(None) {
-            for b in buckets {
-                if b.starts_with(q) {
-                    let s = format!("buckets/{}", b);
-                    results.push(Pair { display: s.clone(), replacement: s });
-                }
+    // Back-compat: still complete the `buckets/<ns>/<name>` form if the user
+    // happens to type the prefix, but the canonical form is a bare `<ns>/<name>`.
+    let (prefix, q) = if let Some(rest) = text.strip_prefix("buckets/") {
+        ("buckets/", rest)
+    } else {
+        ("", text)
+    };
+    if let Ok(buckets) = client.list_buckets(None) {
+        for b in buckets {
+            if b.starts_with(q) {
+                let s = format!("{}{}", prefix, b);
+                results.push(Pair { display: s.clone(), replacement: s });
             }
         }
-        return results;
-    }
-    if "buckets/".starts_with(text) {
-        results.push(Pair { display: "buckets/".into(), replacement: "buckets/".into() });
     }
     results
 }
@@ -1796,6 +1813,38 @@ mod tests {
         // No trailing-tilde expansion (unlike shells, we don't touch mid-path tildes).
         assert_eq!(expand_tilde("./~/y").as_ref(), "./~/y");
         assert_eq!(expand_tilde("~user/x").as_ref(), "~user/x");
+    }
+
+    #[test]
+    fn do_open_accepts_bare_ns_name_and_buckets_prefix() {
+        let mk = || Shell::new(Client::with_overrides(None, None));
+
+        let mut sh = mk();
+        sh.run_line("open alice/my-bucket").unwrap();
+        assert_eq!(sh.state.borrow().bucket_id, "alice/my-bucket");
+
+        // Back-compat: `buckets/<ns>/<name>` still works.
+        let mut sh = mk();
+        sh.run_line("open buckets/alice/my-bucket").unwrap();
+        assert_eq!(sh.state.borrow().bucket_id, "alice/my-bucket");
+    }
+
+    #[test]
+    fn do_open_rejects_non_bucket_targets() {
+        let mut sh = Shell::new(Client::with_overrides(None, None));
+
+        // No target.
+        assert!(sh.run_line("open").is_err());
+        // Single segment — not a valid bucket id.
+        assert!(sh.run_line("open alice").is_err());
+        assert!(sh.run_line("open buckets/alice").is_err());
+        // Too many segments.
+        assert!(sh.run_line("open alice/my-bucket/extra").is_err());
+        // Dataset / model kinds are never openable.
+        assert!(sh.run_line("open datasets/squad").is_err());
+        assert!(sh.run_line("open models/meta-llama/Llama-3.1-8B").is_err());
+        // `hf://…` URLs are cp sources, not open targets.
+        assert!(sh.run_line("open hf://buckets/alice/my-bucket").is_err());
     }
 
     #[test]

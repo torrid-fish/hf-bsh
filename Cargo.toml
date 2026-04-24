@@ -1,6 +1,6 @@
 [package]
 name = "hf-bsh"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Interactive bucket shell for the Hugging Face Hub — extension for the `hf` CLI"
 
