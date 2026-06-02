@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hf-bsh"
+version = "0.2.0"
+description = "Interactive bucket shell for the Hugging Face Hub — extension for the `hf` CLI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    # The bucket API (list_bucket_tree / get_bucket_paths_info / batch_bucket_files /
+    # download_bucket_files / copy_files) is only in huggingface_hub 1.x, which
+    # requires Python >=3.10. hf_xet powers the xet CAS data plane and ships
+    # prebuilt wheels per platform.
+    "huggingface_hub[hf_xet]>=1.0",
+]
+
+[project.scripts]
+# `hf extensions install torrid-fish/hf-bsh` creates a venv and verifies this
+# console script exists, then exposes it as `hf bsh`.
+hf-bsh = "hf_bsh.__main__:main"
+
+[tool.setuptools]
+packages = ["hf_bsh"]
