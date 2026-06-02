@@ -1,9 +1,10 @@
 # hf-bsh
 
-An interactive **bucket shell** for the Hugging Face Hub, written in Rust.
+An interactive **bucket shell** for the Hugging Face Hub, written in Python on
+top of [`huggingface_hub`](https://github.com/huggingface/huggingface_hub).
 
 Distributed as an extension for the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli)
-— install once, then launch with `hf bsh`. Also works as a standalone binary.
+— install once, then launch with `hf bsh`. Also works as a standalone command.
 
 ```
 $ hf bsh alice/models
@@ -51,21 +52,27 @@ Or for official-org installs once adopted:
 hf bsh <ns>/<name>             # auto-installs if missing
 ```
 
+The extension installs into an isolated virtualenv under
+`~/.local/share/hf/extensions/hf-bsh/`, so it never touches your global
+Python environment.
+
 ### Standalone
 
 ```
-cargo install --path .                 # → ~/.cargo/bin/hf-bsh
-# or
-cargo build --release                  # → target/release/hf-bsh
+pip install hf-bsh           # from PyPI (or: pip install git+https://github.com/torrid-fish/hf-bsh)
+hf-bsh <ns>/<name>
 ```
 
-For a fully-static musl build:
+Or run from a checkout without installing:
 
 ```
-sudo apt-get install musl-tools              # Debian/Ubuntu
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
+pip install -e .
+python -m hf_bsh <ns>/<name>
 ```
+
+Requires Python ≥ 3.8. The xet data plane is provided by the `hf_xet`
+package, which ships prebuilt wheels for Linux / macOS / Windows — pip picks
+the right one automatically, so there's no per-platform binary to build.
 
 ## Authentication
 
@@ -177,9 +184,8 @@ get checkpoints/ ./backup/                  # recursive
 get train-*.parquet ./data/                 # remote glob expands
 ```
 
-A TTY progress bar shows percentage, throughput, and ETA for both `put`
-and `get`. In non-TTY mode (pipes, logs) it collapses to a single
-one-line summary.
+Transfer progress is shown by `huggingface_hub`/`hf_xet` (a `tqdm` bar in a
+TTY); `hf-bsh` prints a per-file summary line when each transfer completes.
 
 ## Scope & limitations
 
@@ -194,20 +200,21 @@ one-line summary.
 
 ## How it works
 
-- Listings, search, and bucket mutations are direct REST calls to
-  `https://huggingface.co/api/...` over `reqwest` + `rustls` (no
-  `huggingface_hub` dependency).
-- Bucket `cat` streams via the Hugging Face xet CAS protocol through the
-  `hf-xet` crate (`XetDownloadStreamGroup`).
-- Bucket `mv`/`cp` (own-bucket) and `cp hf://...` (cross-repo) are
-  server-side only: the client fetches the source's xet hash (from
-  `paths-info` for buckets or `HEAD /resolve/main/<path>` for
-  datasets/models) and posts NDJSON `copyFile` operations to
-  `/api/buckets/<id>/batch`. No data ever transits the client.
-- Bucket `put` runs an `XetUploadCommit` against the bucket's xet CAS
-  (authenticated with an `xet-write-token` JWT), then posts `addFile`
-  NDJSON with the resulting hashes to the same `/batch` endpoint. Content
-  deduplication happens automatically client↔server.
-- Bucket `get` resolves xet hashes via `paths-info` and streams each file
-  straight to disk via `XetFileDownloadGroup` (parallel chunks, shared
-  CAS connection).
+`hf-bsh` is a thin REPL layer over `huggingface_hub`'s bucket API — all the
+networking and the xet CAS data plane live in the library:
+
+- **Listings / `cat` / `du` / `find` / `tree`** call `list_bucket_tree` and
+  `get_bucket_paths_info`.
+- **`mv` / `cp` (own-bucket)** resolve each source's xet hash via
+  `get_bucket_paths_info`, then issue a single `batch_bucket_files(copy=…,
+  delete=…)` — server-side only, no data transits the client.
+- **`cp hf://datasets|models|buckets/…`** (cross-repo) uses `copy_files`,
+  which resolves the source hash and performs the copy entirely server-side.
+- **`put`** hands local paths to `batch_bucket_files(add=…)`; the library
+  ingests them into the bucket's xet CAS (with automatic content
+  deduplication) and commits the `addFile` records.
+- **`get`** streams files straight to disk via `download_bucket_files`
+  (parallel xet chunks, shared CAS connection).
+
+Auth tokens are resolved by `huggingface_hub` — `$HF_TOKEN` /
+`$HUGGING_FACE_HUB_TOKEN`, then the saved token file from `hf auth login`.

@@ -1,2 +1,12 @@
 CLAUDE.md
 target
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
