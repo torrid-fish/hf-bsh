@@ -7,12 +7,13 @@ name = "hf-bsh"
 version = "0.2.0"
 description = "Interactive bucket shell for the Hugging Face Hub — extension for the `hf` CLI"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
     # The bucket API (list_bucket_tree / get_bucket_paths_info / batch_bucket_files /
-    # download_bucket_files / copy_files) landed in 1.x. hf_xet powers the
-    # xet CAS data plane and ships prebuilt wheels per platform.
+    # download_bucket_files / copy_files) is only in huggingface_hub 1.x, which
+    # requires Python >=3.10. hf_xet powers the xet CAS data plane and ships
+    # prebuilt wheels per platform.
     "huggingface_hub[hf_xet]>=1.0",
 ]
 

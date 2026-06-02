@@ -70,7 +70,8 @@ pip install -e .
 python -m hf_bsh <ns>/<name>
 ```
 
-Requires Python ≥ 3.8. The xet data plane is provided by the `hf_xet`
+Requires Python ≥ 3.10 (the Hugging Face bucket API lives in
+`huggingface_hub` 1.x, which dropped older Pythons). The xet data plane is provided by the `hf_xet`
 package, which ships prebuilt wheels for Linux / macOS / Windows — pip picks
 the right one automatically, so there's no per-platform binary to build.
 
